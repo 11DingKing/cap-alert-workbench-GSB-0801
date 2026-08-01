@@ -49,7 +49,8 @@ defmodule CapWorkbench.Cap.Enums do
     :rejected,
     :published,
     :correction_created,
-    :cancellation_created
+    :cancellation_created,
+    :superseded
   ]
   # Outbox event types.
   @outbox_events [:published, :corrected, :cancelled]

@@ -132,6 +132,26 @@ defmodule CapWorkbench.Alerts do
     |> Repo.all()
   end
 
+  @doc """
+  Returns the full derivation chain any given message belongs to, oldest first.
+
+  The chain is rooted at the original alert (whose identifier has no `-C<n>`
+  suffix) and includes every correction/cancellation derived from it, in
+  ascending chain-sequence order. This lets the UI display the complete lineage
+  even after a message has been superseded. Versions are preloaded on each link.
+  """
+  def message_chain(%AlertMessage{identifier: identifier}) do
+    root = chain_root(identifier)
+    like = root <> "-C%"
+
+    from(m in AlertMessage,
+      where: m.identifier == ^root or like(m.identifier, ^like)
+    )
+    |> Repo.all()
+    |> Repo.preload(versions: version_order())
+    |> Enum.sort_by(&chain_seq(&1.identifier))
+  end
+
   defp version_order, do: from(v in DraftVersion, order_by: [asc: v.version_number])
 
   # --- Use case: create a brand new draft message ----------------------------
@@ -386,7 +406,7 @@ defmodule CapWorkbench.Alerts do
           |> Ecto.Changeset.optimistic_lock(:lock_version)
         )
         |> Multi.insert(:supersede_audit, fn %{supersede: sup} ->
-          audit(sup, nil, :cancellation_created, actor, "published", "superseded")
+          audit(sup, nil, :superseded, actor, "published", "superseded")
         end)
 
       %{predecessor: _other} ->
@@ -430,32 +450,33 @@ defmodule CapWorkbench.Alerts do
     with true <- StateMachine.can_derive?(source) || {:error, :not_published} do
       source = Repo.preload(source, versions: version_order())
       source_version = published_version(source) || List.last(source.versions)
-      identifier = correction_identifier(source.identifier, msg_type)
 
       overrides = Map.new(overrides)
       infos = build_correction_infos(source_version, overrides)
 
       version_attrs = %{"infos" => infos, "extensions" => source_version.extensions}
 
-      message_attrs = %{
-        identifier: identifier,
-        sender: source.sender,
-        sent_at: DateTime.utc_now(),
-        status: source.status,
-        msg_type: msg_type,
-        scope: source.scope,
-        references_text: cap_reference(source),
-        references_message_id: source.id
-      }
-
-      # Idempotency guard: if a derivation with this deterministic identifier
-      # already exists, return it instead of inserting a duplicate. The unique
-      # index on `identifier` is the ultimate backstop under a race.
-      case Repo.get_by(AlertMessage, identifier: identifier) do
+      # Idempotency guard: a given derivation type (:update / :cancel) off a given
+      # source is created at most once. Repeated or concurrent requests return
+      # the existing derived message instead of a second one.
+      case Repo.get_by(AlertMessage, references_message_id: source.id, msg_type: msg_type) do
         %AlertMessage{} = existing ->
           {:ok, get_message!(existing.id)}
 
         nil ->
+          identifier = next_chain_identifier(source.identifier, msg_type)
+
+          message_attrs = %{
+            identifier: identifier,
+            sender: source.sender,
+            sent_at: DateTime.utc_now(),
+            status: source.status,
+            msg_type: msg_type,
+            scope: source.scope,
+            references_text: cap_reference(source),
+            references_message_id: source.id
+          }
+
           Multi.new()
           |> Multi.insert(:message, AlertMessage.create_changeset(%AlertMessage{}, message_attrs))
           |> Multi.insert(:version, fn %{message: message} ->
@@ -470,7 +491,7 @@ defmodule CapWorkbench.Alerts do
           end)
           |> transact()
           |> normalize_multi(:message)
-          |> translate_identifier_clash(identifier)
+          |> translate_derive_clash(source.id, msg_type)
           |> notify(:derived)
       end
     else
@@ -755,29 +776,62 @@ defmodule CapWorkbench.Alerts do
     Enum.join([message.sender, message.identifier, sent], ",")
   end
 
-  # Deterministic identifier for a correction/cancellation. The suffix is fixed
-  # (`-C1` for the first correction, `-X1` for a cancellation) so that repeated
-  # derivations resolve to the SAME identifier and are therefore idempotent.
-  defp correction_identifier(base_identifier, :update), do: base_identifier <> "-C1"
-  defp correction_identifier(base_identifier, :cancel), do: base_identifier <> "-X1"
+  # Derived messages form a chain rooted at the original identifier. Each
+  # derivation (correction or cancellation) gets the next sequence number across
+  # the whole chain, so a correction off the original is `-C1` and a subsequent
+  # cancellation referencing that correction is `-C2`. This keeps a single,
+  # monotonically increasing lineage regardless of derivation type.
+  defp next_chain_identifier(source_identifier, _msg_type) do
+    root = chain_root(source_identifier)
+    next_seq = chain_max_seq(root) + 1
+    root <> "-C" <> Integer.to_string(next_seq)
+  end
 
-  # If two concurrent derivations race past the existence check, the unique
-  # index on `identifier` rejects the loser; surface the already-created row.
-  defp translate_identifier_clash({:error, %Ecto.Changeset{errors: errors}}, identifier) do
-    if Keyword.has_key?(errors, :identifier) do
-      {:ok, get_message_by_identifier!(identifier)}
-    else
-      {:error, %Ecto.Changeset{errors: errors}}
+  # The root identifier is the original with any trailing `-C<n>` chain suffix
+  # removed.
+  defp chain_root(identifier) do
+    Regex.replace(~r/-C\d+$/, identifier, "")
+  end
+
+  # Highest existing chain sequence for a given root (0 if none yet).
+  defp chain_max_seq(root) do
+    like = root <> "-C%"
+
+    from(m in AlertMessage,
+      where: m.identifier == ^root or like(m.identifier, ^like),
+      select: m.identifier
+    )
+    |> Repo.all()
+    |> Enum.map(&chain_seq/1)
+    |> Enum.max(fn -> 0 end)
+  end
+
+  defp chain_seq(identifier) do
+    case Regex.run(~r/-C(\d+)$/, identifier) do
+      [_, seq] -> String.to_integer(seq)
+      nil -> 0
     end
   end
 
-  defp translate_identifier_clash(other, _identifier), do: other
-
-  defp get_message_by_identifier!(identifier) do
-    AlertMessage
-    |> Repo.get_by!(identifier: identifier)
-    |> then(&get_message!(&1.id))
+  # If two concurrent derivations of the same (source, msg_type) race past the
+  # existence check, one insert loses the unique-index battle; return the row
+  # that actually persisted so the caller still sees a single derived message.
+  defp translate_derive_clash(
+         {:error, %Ecto.Changeset{errors: errors}} = result,
+         source_id,
+         msg_type
+       ) do
+    if Keyword.has_key?(errors, :identifier) do
+      case Repo.get_by(AlertMessage, references_message_id: source_id, msg_type: msg_type) do
+        %AlertMessage{} = existing -> {:ok, get_message!(existing.id)}
+        nil -> result
+      end
+    else
+      result
+    end
   end
+
+  defp translate_derive_clash(other, _source_id, _msg_type), do: other
 
   # A losing optimistic-lock writer surfaces as a StaleEntryError from the
   # transaction; translate to the documented `{:error, :stale}` tuple so callers

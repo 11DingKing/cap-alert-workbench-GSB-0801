@@ -234,7 +234,8 @@ defmodule CapWorkbench.AlertsTest do
       published = published_message_fixture()
       assert {:ok, cancel} = Alerts.create_cancellation(published, %{}, "值班员")
       assert cancel.msg_type == :cancel
-      assert cancel.identifier == published.identifier <> "-X1"
+      # First derivation in the chain, regardless of type, is -C1.
+      assert cancel.identifier == published.identifier <> "-C1"
       assert cancel.references_message_id == published.id
     end
 
@@ -301,6 +302,157 @@ defmodule CapWorkbench.AlertsTest do
       # Predecessor is now superseded.
       reloaded_predecessor = Alerts.get_message!(published.id)
       assert reloaded_predecessor.workflow_state == :superseded
+    end
+  end
+
+  describe "cancellation referencing a published correction (CN-...-C2)" do
+    # Drives a derived draft (correction/cancellation) all the way to published.
+    defp publish_derived(message) do
+      v = Alerts.latest_version(message)
+      {:ok, message} = Alerts.submit_for_review(message, v, message.lock_version, "值班员")
+      v = Alerts.latest_version(message)
+      {:ok, message} = Alerts.review(message, v, :approve, "复核员", nil, message.lock_version)
+      v = Alerts.latest_version(message)
+      {:ok, message} = Alerts.publish(message, v, message.lock_version, "值班员")
+      message
+    end
+
+    test "cancel of published C1 gets -C2, references C1 exactly, and keeps its multi-info parse" do
+      # Round 1: publish the original alert.
+      original = published_message_fixture()
+
+      # Round 2: correction C1 lifts 440900 to Extreme while 440800 stays Severe,
+      # then publish it so it becomes the latest published document.
+      {:ok, c1} =
+        Alerts.create_correction(
+          original,
+          %{region_severities: %{"440900" => :extreme}},
+          "值班员"
+        )
+
+      assert c1.identifier == original.identifier <> "-C1"
+      c1 = publish_derived(c1)
+      assert c1.workflow_state == :published
+
+      # Round 4: cancellation derived from the published C1.
+      {:ok, c2} = Alerts.create_cancellation(c1, %{}, "值班员")
+
+      assert c2.msg_type == :cancel
+      # Next link in the same chain, so -C2 (not -C1 nor -X1).
+      assert c2.identifier == original.identifier <> "-C2"
+      # References the published C1 exactly.
+      assert c2.references_message_id == c1.id
+      assert c2.references_text =~ c1.identifier
+      assert c2.references_text =~ c1.sender
+
+      # The cancellation preserves C1's verified multi-info parse: both regions,
+      # each with its own severity, carried in two distinct info blocks.
+      infos = Alerts.latest_version(c2).infos
+      assert length(infos) == 2
+
+      by_geocode =
+        infos
+        |> Enum.flat_map(fn info -> Enum.map(info.geocodes, &{&1, info.severity}) end)
+        |> Map.new()
+
+      assert by_geocode["440800"] == :severe
+      assert by_geocode["440900"] == :extreme
+    end
+
+    test "creating the C2 cancellation is idempotent" do
+      original = published_message_fixture()
+
+      {:ok, c1} =
+        Alerts.create_correction(original, %{region_severities: %{"440900" => :extreme}}, "值班员")
+
+      c1 = publish_derived(c1)
+
+      assert {:ok, c2a} = Alerts.create_cancellation(c1, %{}, "值班员")
+      assert {:ok, c2b} = Alerts.create_cancellation(c1, %{}, "值班员")
+
+      # Same row, not a second cancellation.
+      assert c2a.id == c2b.id
+      assert c2a.identifier == original.identifier <> "-C2"
+
+      alias CapWorkbench.Cap.AlertMessage
+
+      count =
+        Repo.aggregate(
+          from(m in AlertMessage, where: m.references_message_id == ^c1.id),
+          :count
+        )
+
+      assert count == 1
+    end
+
+    test "the full version chain remains viewable after cancellation" do
+      original = published_message_fixture()
+
+      {:ok, c1} =
+        Alerts.create_correction(original, %{region_severities: %{"440900" => :extreme}}, "值班员")
+
+      c1 = publish_derived(c1)
+      {:ok, c2} = Alerts.create_cancellation(c1, %{}, "值班员")
+      c2 = publish_derived(c2)
+
+      # After cancellation, C1 is superseded but still exists in the chain.
+      assert Alerts.get_message!(c1.id).workflow_state == :superseded
+
+      chain = Alerts.message_chain(c2)
+
+      identifiers = Enum.map(chain, & &1.identifier)
+
+      assert identifiers == [
+               original.identifier,
+               original.identifier <> "-C1",
+               original.identifier <> "-C2"
+             ]
+
+      # Every link still carries its immutable versions.
+      assert Enum.all?(chain, fn m -> m.versions != [] end)
+      # The chain can be reached from any of its members.
+      assert Alerts.message_chain(original) == chain
+    end
+
+    test "every state transition is audited across the whole chain" do
+      original = published_message_fixture()
+
+      {:ok, c1} =
+        Alerts.create_correction(original, %{region_severities: %{"440900" => :extreme}}, "值班员")
+
+      c1 = publish_derived(c1)
+      {:ok, c2} = Alerts.create_cancellation(c1, %{}, "值班员")
+      c2 = publish_derived(c2)
+
+      original_actions = Enum.map(Alerts.list_audit_events(original), & &1.action)
+      c1_actions = Enum.map(Alerts.list_audit_events(c1), & &1.action)
+      c2_actions = Enum.map(Alerts.list_audit_events(c2), & &1.action)
+
+      # Original: created → submitted → approved → published → superseded (by C1).
+      assert original_actions == [
+               :draft_created,
+               :submitted_for_review,
+               :approved,
+               :published,
+               :superseded
+             ]
+
+      # C1: created as correction → submitted → approved → published → superseded (by C2).
+      assert c1_actions == [
+               :correction_created,
+               :submitted_for_review,
+               :approved,
+               :published,
+               :superseded
+             ]
+
+      # C2: created as cancellation → submitted → approved → published.
+      assert c2_actions == [
+               :cancellation_created,
+               :submitted_for_review,
+               :approved,
+               :published
+             ]
     end
   end
 
