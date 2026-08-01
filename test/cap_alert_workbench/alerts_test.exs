@@ -621,6 +621,110 @@ defmodule CapAlertWorkbench.AlertsTest do
     assert {:error, :identifier_taken} = Alerts.import_cap_xml(xml, "importer")
   end
 
+  @ext02_xml """
+  <?xml version="1.0" encoding="UTF-8"?>
+  <alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+    <identifier>CN-20260729-GD-RAIN-EXT-02</identifier>
+    <sender>ext-feed@partner.example.cn</sender>
+    <sent>2026-07-29T09:30:00+08:00</sent>
+    <status>Actual</status>
+    <msgType>Alert</msgType>
+    <scope>Public</scope>
+    <info>
+      <language>zh-CN</language>
+      <category>Met</category>
+      <event>暴雨 &amp; 强对流</event>
+      <urgency>Immediate</urgency>
+      <severity>Severe</severity>
+      <certainty>Likely</certainty>
+      <headline>“湛江”暴雨红色预警 &lt;外部转发&gt;</headline>
+      <description>湛江市有大暴雨 &amp; 雷暴大风，注意“城乡积涝”风险</description>
+      <area>
+        <areaDesc>湛江市</areaDesc>
+        <geocode><valueName>region</valueName><value>440800</value></geocode>
+      </area>
+      <x:evac xmlns:x="http://ext.example/evac" x:level="2">转移 &amp; 安置“低洼区”</x:evac>
+    </info>
+    <info>
+      <language>zh-CN</language>
+      <category>Met</category>
+      <event>暴雨 &amp; 强对流</event>
+      <urgency>Immediate</urgency>
+      <severity>Extreme</severity>
+      <certainty>Likely</certainty>
+      <headline>“茂名”升级为极端暴雨 &lt;特急&gt;</headline>
+      <description>茂名市雨势“极端”增强 &amp; 伴有龙卷风险</description>
+      <area>
+        <areaDesc>茂名市</areaDesc>
+        <geocode><valueName>region</valueName><value>440900</value></geocode>
+      </area>
+      <x:shelter xmlns:x="http://ext.example/evac" x:capacity="5000">避难场所 &lt;名单&gt; &amp; 容量</x:shelter>
+    </info>
+  </alert>
+  """
+
+  test "导入外部多 info 消息：特殊字符与扩展节点完整 round-trip，仅生成待复核版本" do
+    assert {:ok, %{stream: stream, version: version}} =
+             Alerts.import_cap_xml(@ext02_xml, "importer")
+
+    assert stream.identifier == "CN-20260729-GD-RAIN-EXT-02"
+    # 导入只生成待复核草稿，不绕过编审流程
+    assert version.workflow == :editing
+
+    assert {:error, {:invalid_transition, :editing, :publish}} =
+             Alerts.publish(version.id, "importer")
+
+    # 导出再解析：与原始文档逐字段相等（特殊字符、扩展节点、地区-严重度对应）
+    {:ok, exported} = Alerts.export_cap_xml(version.id)
+    assert {:ok, original} = CapAlertWorkbench.Cap.Xml.parse(@ext02_xml)
+    assert {:ok, round_tripped} = CapAlertWorkbench.Cap.Xml.parse(exported)
+    assert round_tripped == original
+
+    [i1, i2] = round_tripped.infos
+    assert i1.headline == "“湛江”暴雨红色预警 <外部转发>"
+    assert i1.description =~ "“城乡积涝”"
+    assert i1.severity == :severe
+    assert Info.geocodes(i1) == ["440800"]
+    assert length(i1.extensions) == 1
+
+    assert i2.headline == "“茂名”升级为极端暴雨 <特急>"
+    assert i2.severity == :extreme
+    assert Info.geocodes(i2) == ["440900"]
+    assert length(i2.extensions) == 1
+
+    # 扩展节点内容未被吞掉
+    assert exported =~ "转移 &amp; 安置“低洼区”"
+    assert exported =~ "避难场所 &lt;名单&gt; &amp; 容量"
+    assert exported =~ ~s(x:capacity="5000")
+  end
+
+  test "基于 C1 发布前版本的旧草稿：发布返回 not_latest_version，不覆盖更正稿" do
+    %{version: v1, correction: correction} = correction_fixture()
+
+    # 更正稿设定地区级严重度（440800 Severe / 440900 Extreme）
+    {:ok, edited} =
+      Alerts.update_draft(
+        correction.id,
+        %{payload: split_infos_payload(correction.payload)},
+        correction.lock_version,
+        "editor"
+      )
+
+    # 旧草稿（v1）发起发布 → not_latest_version
+    assert {:error, :not_latest_version} = Alerts.publish(v1.id, "stale-editor")
+
+    # 旧草稿（v1，已发布冻结）尝试编辑 → 拒绝
+    assert {:error, {:invalid_transition, :published, :edit}} =
+             Alerts.update_draft(v1.id, %{payload: payload_fixture()}, 2, "stale-editor")
+
+    # 第 2 轮（更正稿）的地区级严重度未被覆盖
+    fresh = Repo.get!(Version, edited.id)
+    [i1, i2] = fresh.payload["infos"]
+    assert i1["severity"] == "Severe"
+    assert i2["severity"] == "Extreme"
+    assert Repo.get_by!(Alerts.Stream, id: v1.stream_id).state == :published
+  end
+
   test "版本差异按字段返回（多 info 路径）" do
     %{version: version} = stream_fixture()
 
