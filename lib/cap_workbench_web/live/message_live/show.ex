@@ -2,11 +2,14 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
   @moduledoc """
   The per-message workbench: draft editing, version diff, review, and publish.
 
-  All state changes go through `CapWorkbench.Alerts`. This LiveView keeps a
-  `lock_version` snapshot for optimistic concurrency; on a `{:error, :stale}`
-  from any use-case it reloads and asks the operator to retry, so two browsers
-  editing the same draft never silently clobber each other. It subscribes to
-  the message topic so a change made elsewhere refreshes the page immediately.
+  Content is a list of CAP `<info>` blocks; the editor manages an editable list
+  in `@info_drafts` (add/remove blocks, edit fields) and saves the whole set as
+  a new immutable version. The diff tab compares two versions **per region**.
+  Corrections are created per region: the operator picks a target severity for
+  each geocode, and the domain splits regions into their own info blocks.
+
+  All state changes go through `CapWorkbench.Alerts`. A `lock_version` snapshot
+  drives optimistic concurrency; PubSub keeps concurrent viewers in sync.
   """
   use CapWorkbenchWeb, :live_view
 
@@ -25,6 +28,7 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
      |> assign(:diff_to_id, nil)
      |> assign(:review_comment, "")
      |> assign(:xml_preview, nil)
+     |> assign(:region_severities, %{})
      |> load(id)}
   end
 
@@ -36,33 +40,29 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
     {:noreply, assign(socket, :tab, tab)}
   end
 
-  # --- Draft editing: save a NEW immutable version ---------------------------
+  # --- Draft editing: manage the editable list of info blocks ----------------
 
   def handle_event("validate", %{"draft" => params}, socket) do
-    form =
-      socket.assigns.latest
-      |> Alerts.change_version(params)
-      |> Map.put(:action, :validate)
-      |> to_form(as: :draft)
+    {:noreply, assign(socket, :info_drafts, infos_from_params(params))}
+  end
 
-    {:noreply, assign(socket, :form, %{form | params: params})}
+  def handle_event("add_info", _params, socket) do
+    {:noreply, assign(socket, :info_drafts, socket.assigns.info_drafts ++ [blank_info()])}
+  end
+
+  def handle_event("remove_info", %{"index" => index}, socket) do
+    idx = String.to_integer(index)
+    drafts = List.delete_at(socket.assigns.info_drafts, idx)
+    {:noreply, assign(socket, :info_drafts, if(drafts == [], do: [blank_info()], else: drafts))}
   end
 
   def handle_event("save_version", %{"draft" => params}, socket) do
-    %{message: message, latest: latest} = socket.assigns
-    attrs = content_attrs(params, latest)
+    %{message: message} = socket.assigns
+    infos = infos_from_params(params)
 
-    case Alerts.save_new_version(
-           message,
-           params_to_changeset_input(attrs),
-           message.lock_version,
-           "值班员"
-         ) do
+    case Alerts.save_new_version(message, %{"infos" => infos}, message.lock_version, "值班员") do
       {:ok, _message} ->
-        {:noreply,
-         socket
-         |> put_flash(:info, "已保存为新版本。")
-         |> load(message.id)}
+        {:noreply, socket |> put_flash(:info, "已保存为新版本。") |> load(message.id)}
 
       {:error, :stale} ->
         {:noreply,
@@ -74,7 +74,10 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
         {:noreply, put_flash(socket, :error, "该消息已发布或被更正，无法继续编辑。")}
 
       {:error, %Ecto.Changeset{} = changeset} ->
-        {:noreply, assign(socket, :form, to_form(changeset, as: :draft))}
+        {:noreply,
+         socket
+         |> assign(:info_drafts, infos)
+         |> assign(:edit_errors, changeset_error_summary(changeset))}
     end
   end
 
@@ -137,12 +140,25 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
 
   # --- Corrections / cancellations -------------------------------------------
 
+  # The operator sets a per-region target severity; the domain splits regions
+  # so only the changed ones move (e.g. 440900 -> Extreme, 440800 stays Severe).
+  def handle_event("set_region_severity", %{"geocode" => geocode, "severity" => severity}, socket) do
+    {:noreply,
+     assign(
+       socket,
+       :region_severities,
+       Map.put(socket.assigns.region_severities, geocode, severity)
+     )}
+  end
+
   def handle_event("create_correction", _params, socket) do
-    case Alerts.create_correction(socket.assigns.message, %{}, "值班员") do
+    overrides = %{region_severities: socket.assigns.region_severities}
+
+    case Alerts.create_correction(socket.assigns.message, overrides, "值班员") do
       {:ok, new_message} ->
         {:noreply,
          socket
-         |> put_flash(:info, "已基于已发布版本创建更正草稿。")
+         |> put_flash(:info, "已基于最新已发布文档创建更正 #{new_message.identifier}。")
          |> push_navigate(to: ~p"/messages/#{new_message.id}")}
 
       {:error, reason} ->
@@ -155,7 +171,7 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
       {:ok, new_message} ->
         {:noreply,
          socket
-         |> put_flash(:info, "已基于已发布版本创建解除草稿。")
+         |> put_flash(:info, "已基于已发布版本创建解除 #{new_message.identifier}。")
          |> push_navigate(to: ~p"/messages/#{new_message.id}")}
 
       {:error, reason} ->
@@ -166,7 +182,11 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
   # --- Diff ------------------------------------------------------------------
 
   def handle_event("set_diff", %{"from" => from_id, "to" => to_id}, socket) do
-    {:noreply, socket |> assign(:diff_from_id, from_id) |> assign(:diff_to_id, to_id)}
+    {:noreply,
+     socket
+     |> assign(:diff_from_id, from_id)
+     |> assign(:diff_to_id, to_id)
+     |> assign(:diff, compute_diff(socket.assigns.versions, from_id, to_id))}
   end
 
   # --- XML preview -----------------------------------------------------------
@@ -195,49 +215,46 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
     end
   end
 
-  # --- Read-only version display component ------------------------------------
+  # --- Read-only info block display component --------------------------------
 
   attr :version, :map, required: true
 
   def version_readonly(assigns) do
     ~H"""
-    <dl
-      class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-2 text-sm"
-      id={"version-readonly-#{@version.id}"}
-    >
-      <div>
-        <dt class="text-base-content/60">标题</dt><dd class="font-medium">{@version.headline}</dd>
+    <div class="mt-4 space-y-4" id={"version-readonly-#{@version.id}"}>
+      <div
+        :for={{info, idx} <- Enum.with_index(@version.infos)}
+        id={"version-#{@version.id}-info-#{idx}"}
+        class="rounded-lg border border-base-300 p-4"
+      >
+        <div class="flex items-center gap-2 mb-2">
+          <span class="badge badge-outline">段 {idx + 1}</span>
+          <span class={["badge", severity_badge(info.severity)]}>{info.severity}</span>
+          <span class="font-mono text-xs text-base-content/60">
+            {Enum.join(info.geocodes, ", ")}
+          </span>
+        </div>
+        <dl class="grid grid-cols-1 md:grid-cols-2 gap-x-6 gap-y-1 text-sm">
+          <div>
+            <dt class="text-base-content/60">标题</dt><dd class="font-medium">{info.headline}</dd>
+          </div>
+          <div>
+            <dt class="text-base-content/60">区域</dt><dd>{info.area_description}</dd>
+          </div>
+          <div class="md:col-span-2">
+            <dt class="text-base-content/60">描述</dt><dd class="whitespace-pre-wrap">
+              {info.description}
+            </dd>
+          </div>
+          <div>
+            <dt class="text-base-content/60">紧急度/确定性</dt><dd>{info.urgency} · {info.certainty}</dd>
+          </div>
+          <div>
+            <dt class="text-base-content/60">类别/语言</dt><dd>{info.category} · {info.language}</dd>
+          </div>
+        </dl>
       </div>
-      <div>
-        <dt class="text-base-content/60">事件</dt><dd>{@version.event}</dd>
-      </div>
-      <div class="md:col-span-2">
-        <dt class="text-base-content/60">描述</dt><dd class="whitespace-pre-wrap">
-          {@version.description}
-        </dd>
-      </div>
-      <div class="md:col-span-2">
-        <dt class="text-base-content/60">处置建议</dt><dd class="whitespace-pre-wrap">
-          {@version.instruction}
-        </dd>
-      </div>
-      <div>
-        <dt class="text-base-content/60">紧急度/严重度/确定性</dt><dd>
-          {@version.urgency} · {@version.severity} · {@version.certainty}
-        </dd>
-      </div>
-      <div>
-        <dt class="text-base-content/60">类别/语言</dt><dd>{@version.category} · {@version.language}</dd>
-      </div>
-      <div>
-        <dt class="text-base-content/60">区域描述</dt><dd>{@version.area_description}</dd>
-      </div>
-      <div>
-        <dt class="text-base-content/60">地区编码</dt><dd class="font-mono">
-          {Enum.join(@version.geocodes, ", ")}
-        </dd>
-      </div>
-    </dl>
+    </div>
     """
   end
 
@@ -258,11 +275,74 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
     |> assign(:published_version, published_version(message, versions))
     |> assign(:audit_events, Alerts.list_audit_events(message))
     |> assign(:outbox_entries, Alerts.list_outbox_entries(message))
-    |> assign(:form, latest |> Alerts.change_version(%{}) |> to_form(as: :draft))
+    |> assign(:info_drafts, latest_info_drafts(latest))
+    |> assign(:edit_errors, [])
+    |> assign(:region_severities, region_severity_defaults(latest))
     |> assign(:diff_from_id, diff_from_id)
     |> assign(:diff_to_id, diff_to_id)
     |> assign(:diff, compute_diff(versions, diff_from_id, diff_to_id))
   end
+
+  defp latest_info_drafts(nil), do: [blank_info()]
+
+  defp latest_info_drafts(version) do
+    Enum.map(version.infos, fn info ->
+      %{
+        "headline" => info.headline,
+        "description" => info.description,
+        "instruction" => info.instruction,
+        "event" => info.event,
+        "category" => to_string(info.category),
+        "urgency" => to_string(info.urgency),
+        "severity" => to_string(info.severity),
+        "certainty" => to_string(info.certainty),
+        "language" => info.language,
+        "area_description" => info.area_description,
+        "geocodes" => Enum.join(info.geocodes, ", ")
+      }
+    end)
+  end
+
+  # A per-geocode map of the currently published severity, used to prefill the
+  # correction form.
+  defp region_severity_defaults(nil), do: %{}
+
+  defp region_severity_defaults(version) do
+    Enum.reduce(version.infos, %{}, fn info, acc ->
+      Enum.reduce(info.geocodes, acc, fn geo, inner ->
+        Map.put(inner, geo, to_string(info.severity))
+      end)
+    end)
+  end
+
+  defp blank_info do
+    %{
+      "headline" => "",
+      "description" => "",
+      "instruction" => "",
+      "event" => "",
+      "category" => "met",
+      "urgency" => "immediate",
+      "severity" => "severe",
+      "certainty" => "likely",
+      "language" => "zh-CN",
+      "area_description" => "",
+      "geocodes" => ""
+    }
+  end
+
+  # Rebuilds the ordered list of info maps from submitted form params. Params
+  # arrive as %{"infos" => %{"0" => %{...}, "1" => %{...}}}; convert to a list
+  # with geocodes split into a list, keyed by strings for the changeset.
+  defp infos_from_params(%{"infos" => infos}) when is_map(infos) do
+    infos
+    |> Enum.sort_by(fn {idx, _} -> String.to_integer(idx) end)
+    |> Enum.map(fn {_idx, info} ->
+      Map.put(info, "geocodes", split_geocodes(info["geocodes"] || ""))
+    end)
+  end
+
+  defp infos_from_params(_), do: [blank_info()]
 
   defp default_diff_from(versions) when length(versions) >= 2 do
     Enum.at(versions, -2).id
@@ -284,25 +364,6 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
 
   defp compute_diff(_versions, _from, _to), do: []
 
-  # Merge edited params over the latest version to form a full content map.
-  defp content_attrs(params, _latest), do: params
-
-  defp params_to_changeset_input(params) do
-    params
-    |> Map.update("geocodes", [], &split_geocodes/1)
-    |> normalize_enum_keys()
-  end
-
-  defp normalize_enum_keys(params) do
-    Enum.reduce(~w(category urgency severity certainty), params, fn key, acc ->
-      case Map.get(acc, key) do
-        nil -> acc
-        "" -> acc
-        value -> Map.put(acc, key, value)
-      end
-    end)
-  end
-
   defp split_geocodes(value) when is_list(value), do: value
 
   defp split_geocodes(value) when is_binary(value) do
@@ -310,6 +371,12 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
     |> String.split([",", " ", "\n", "，"], trim: true)
     |> Enum.map(&String.trim/1)
     |> Enum.reject(&(&1 == ""))
+  end
+
+  defp changeset_error_summary(changeset) do
+    changeset
+    |> Ecto.Changeset.traverse_errors(fn {msg, _opts} -> msg end)
+    |> Enum.map(fn {field, errs} -> "#{field}: #{inspect(errs)}" end)
   end
 
   # --- Guards for the template -----------------------------------------------
@@ -332,6 +399,11 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
   def review_state_label(:approved), do: "已通过"
   def review_state_label(:rejected), do: "已退回"
 
+  def severity_badge(:extreme), do: "badge-error"
+  def severity_badge(:severe), do: "badge-warning"
+  def severity_badge(:moderate), do: "badge-info"
+  def severity_badge(_), do: "badge-ghost"
+
   def field_label(:headline), do: "标题"
   def field_label(:description), do: "描述"
   def field_label(:instruction), do: "处置建议"
@@ -348,6 +420,11 @@ defmodule CapWorkbenchWeb.MessageLive.Show do
   def render_value(value) when is_list(value), do: Enum.join(value, ", ")
   def render_value(nil), do: ""
   def render_value(value), do: to_string(value)
+
+  def region_status_label(:added), do: "新增"
+  def region_status_label(:removed), do: "移除"
+  def region_status_label(:changed), do: "变更"
+  def region_status_label(:unchanged), do: "未变"
 
   defp error_text(:stale), do: "版本冲突：内容已被他人修改，已为你重新载入，请重试。"
   defp error_text(:stale_review), do: "复核结论已失效，请针对最新版本重新复核。"

@@ -20,41 +20,59 @@ defmodule CapWorkbench.AlertsTest do
     end
 
     test "rejects invalid geocodes" do
-      assert {:error, changeset} = Alerts.create_message(valid_attrs(%{geocodes: ["44"]}), "x")
-      assert %{geocodes: [_ | _]} = errors_on(changeset)
+      attrs = valid_attrs(%{infos: [valid_info(%{"geocodes" => ["44"]})]})
+      assert {:error, changeset} = Alerts.create_message(attrs, "x")
+      refute changeset.valid?
     end
+  end
+
+  # Replaces the single info block's headline via save_new_version.
+  defp edit_headline(message, headline) do
+    latest = Alerts.latest_version(message)
+    info = hd(latest.infos)
+    infos = [Map.merge(Alerts.info_to_map(info), %{"headline" => headline})]
+    Alerts.save_new_version(message, %{"infos" => infos}, message.lock_version)
   end
 
   describe "save_new_version/4 (edit)" do
     test "creates a new immutable version and never mutates the old one" do
       message = message_fixture()
       [v1] = message.versions
+      v1_headline = hd(v1.infos).headline
 
-      assert {:ok, message} =
-               Alerts.save_new_version(message, %{"headline" => "更新后的标题"}, message.lock_version)
+      assert {:ok, message} = edit_headline(message, "更新后的标题")
 
       versions = message.versions
       assert length(versions) == 2
       assert Enum.map(versions, & &1.version_number) == [1, 2]
 
       reloaded_v1 = Alerts.get_version!(v1.id)
-      assert reloaded_v1.headline == v1.headline
-      assert List.last(versions).headline == "更新后的标题"
+      assert hd(reloaded_v1.infos).headline == v1_headline
+      assert hd(List.last(versions).infos).headline == "更新后的标题"
     end
 
     test "optimistic lock: the second concurrent writer loses with :stale" do
       message = message_fixture()
       stale_lock = message.lock_version
+      info_map = Alerts.info_to_map(hd(Alerts.latest_version(message).infos))
 
       # First writer wins.
       assert {:ok, updated} =
-               Alerts.save_new_version(message, %{"headline" => "writer A"}, stale_lock)
+               Alerts.save_new_version(
+                 message,
+                 %{"infos" => [Map.put(info_map, "headline", "writer A")]},
+                 stale_lock
+               )
 
       refute updated.lock_version == stale_lock
 
       # Second writer used the SAME (now stale) lock version -> conflict.
       assert {:error, :stale} =
-               Alerts.save_new_version(message, %{"headline" => "writer B"}, stale_lock)
+               Alerts.save_new_version(
+                 message,
+                 %{"infos" => [Map.put(info_map, "headline", "writer B")]},
+                 stale_lock
+               )
 
       # Only writer A's version was persisted (plus the original) = 2 total.
       reloaded = Alerts.get_message!(message.id)
@@ -85,8 +103,7 @@ defmodule CapWorkbench.AlertsTest do
 
       # A new draft is saved while review is pending; message drops to drafting
       # and old_version is no longer the one to act on.
-      {:ok, message} =
-        Alerts.save_new_version(message, %{"headline" => "新草稿抢占"}, message.lock_version)
+      {:ok, message} = edit_headline(message, "新草稿抢占")
 
       # Reviewer still holds the OLD version and tries to approve it.
       assert {:error, :stale_review} =
@@ -174,23 +191,50 @@ defmodule CapWorkbench.AlertsTest do
   end
 
   describe "corrections and cancellations" do
-    test "correction derives a new :update message referencing the published one" do
+    test "correction derives a new :update message referencing the published one exactly" do
+      published = published_message_fixture()
+
+      assert {:ok, correction} = Alerts.create_correction(published, %{}, "值班员")
+
+      assert correction.msg_type == :update
+      assert correction.identifier == published.identifier <> "-C1"
+      assert correction.references_message_id == published.id
+      # references text points exactly at the source (sender,identifier,sent).
+      assert correction.references_text =~ published.identifier
+      assert correction.references_text =~ published.sender
+      assert correction.workflow_state == :drafting
+    end
+
+    test "per-region correction: 440900 -> Extreme while 440800 stays Severe" do
+      # Seed a single info covering both regions at Severe, publish it.
       published = published_message_fixture()
 
       assert {:ok, correction} =
-               Alerts.create_correction(published, %{headline: "更正：升级为红色"}, "值班员")
+               Alerts.create_correction(
+                 published,
+                 %{region_severities: %{"440900" => :extreme}},
+                 "值班员"
+               )
 
-      assert correction.msg_type == :update
-      assert correction.references_message_id == published.id
-      assert correction.references_text =~ published.identifier
-      assert correction.workflow_state == :drafting
-      assert Alerts.latest_version(correction).headline == "更正：升级为红色"
+      infos = Alerts.latest_version(correction).infos
+
+      by_geocode =
+        Enum.flat_map(infos, fn info ->
+          Enum.map(info.geocodes, fn geo -> {geo, info.severity} end)
+        end)
+        |> Map.new()
+
+      assert by_geocode["440800"] == :severe
+      assert by_geocode["440900"] == :extreme
+      # The two regions must be carried in distinct info blocks.
+      assert length(infos) == 2
     end
 
     test "cancellation derives a new :cancel message" do
       published = published_message_fixture()
       assert {:ok, cancel} = Alerts.create_cancellation(published, %{}, "值班员")
       assert cancel.msg_type == :cancel
+      assert cancel.identifier == published.identifier <> "-X1"
       assert cancel.references_message_id == published.id
     end
 
@@ -199,9 +243,45 @@ defmodule CapWorkbench.AlertsTest do
       assert {:error, :not_published} = Alerts.create_correction(message, %{}, "x")
     end
 
+    test "creating a correction is idempotent: repeated calls return the same C1" do
+      published = published_message_fixture()
+
+      assert {:ok, c1a} =
+               Alerts.create_correction(
+                 published,
+                 %{region_severities: %{"440900" => :extreme}},
+                 "值班员"
+               )
+
+      assert {:ok, c1b} =
+               Alerts.create_correction(
+                 published,
+                 %{region_severities: %{"440900" => :extreme}},
+                 "值班员"
+               )
+
+      # Same row, not a second C1.
+      assert c1a.id == c1b.id
+      assert c1a.identifier == published.identifier <> "-C1"
+
+      # Exactly one correction exists in the database.
+      import Ecto.Query
+      alias CapWorkbench.Cap.AlertMessage
+
+      count =
+        Repo.aggregate(
+          from(m in AlertMessage, where: m.references_message_id == ^published.id),
+          :count
+        )
+
+      assert count == 1
+    end
+
     test "publishing a correction supersedes its predecessor atomically" do
       published = published_message_fixture()
-      {:ok, correction} = Alerts.create_correction(published, %{headline: "更正稿"}, "值班员")
+
+      {:ok, correction} =
+        Alerts.create_correction(published, %{region_severities: %{"440900" => :extreme}}, "值班员")
 
       v = Alerts.latest_version(correction)
       {:ok, correction} = Alerts.submit_for_review(correction, v, correction.lock_version)
@@ -215,6 +295,9 @@ defmodule CapWorkbench.AlertsTest do
 
       assert correction.workflow_state == :published
 
+      # Publishing produces exactly one outbox entry for the correction.
+      assert length(Alerts.list_outbox_entries(correction)) == 1
+
       # Predecessor is now superseded.
       reloaded_predecessor = Alerts.get_message!(published.id)
       assert reloaded_predecessor.workflow_state == :superseded
@@ -224,28 +307,45 @@ defmodule CapWorkbench.AlertsTest do
   describe "content immutability of published messages" do
     test "a published message cannot be edited via save_new_version" do
       message = published_message_fixture()
+      info_map = Alerts.info_to_map(hd(Alerts.latest_version(message).infos))
 
       assert {:error, :not_editable} =
-               Alerts.save_new_version(message, %{"headline" => "偷偷改"}, message.lock_version)
+               Alerts.save_new_version(
+                 message,
+                 %{"infos" => [Map.put(info_map, "headline", "偷偷改")]},
+                 message.lock_version
+               )
     end
   end
 
-  describe "diff_versions/2" do
-    test "flags changed fields between two versions" do
+  describe "diff_versions/2 (per region)" do
+    test "reports per-region status and changes" do
+      # v1: both regions Severe in one block. v2: split so 440900 -> Extreme.
       message = message_fixture()
+      source_info = Alerts.info_to_map(hd(Alerts.latest_version(message).infos))
+
+      infos_v2 = [
+        Map.merge(source_info, %{"geocodes" => ["440800"], "severity" => "severe"}),
+        Map.merge(source_info, %{
+          "geocodes" => ["440900"],
+          "severity" => "extreme",
+          "headline" => "茂名升级"
+        })
+      ]
 
       {:ok, message} =
-        Alerts.save_new_version(message, %{"headline" => "改了标题"}, message.lock_version)
+        Alerts.save_new_version(message, %{"infos" => infos_v2}, message.lock_version)
 
       [v1, v2] = message.versions
 
       diff = Alerts.diff_versions(v1, v2)
-      headline_row = Enum.find(diff, &(&1.field == :headline))
-      assert headline_row.changed?
-      assert headline_row.to == "改了标题"
 
-      event_row = Enum.find(diff, &(&1.field == :event))
-      refute event_row.changed?
+      row_800 = Enum.find(diff, &(&1.geocode == "440800"))
+      row_900 = Enum.find(diff, &(&1.geocode == "440900"))
+
+      assert row_800.status == :unchanged
+      assert row_900.status == :changed
+      assert Enum.any?(row_900.changes, &(&1.field == :severity and &1.to == :extreme))
     end
   end
 end

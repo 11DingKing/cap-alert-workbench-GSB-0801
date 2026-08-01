@@ -135,8 +135,10 @@ defmodule CapWorkbenchWeb.Api.MessageController do
   # Casts external JSON into the domain attribute map. Enum labels are resolved
   # against the whitelisted `Enums` values — unknown values become nil so the
   # changeset returns a validation error (never String.to_atom on user input).
+  #
+  # `params["infos"]` is a list of info-block maps; each is normalized here.
   defp cast_content(params, mode \\ :full) do
-    attrs =
+    envelope =
       %{
         identifier: params["identifier"],
         sender: params["sender"],
@@ -144,32 +146,62 @@ defmodule CapWorkbenchWeb.Api.MessageController do
         status: enum(:status, params["status"]),
         msg_type: enum(:msg_type, params["msg_type"]),
         scope: enum(:scope, params["scope"]),
-        language: params["language"] || "zh-CN",
-        category: enum(:category, params["category"]),
-        event: params["event"],
-        urgency: enum(:urgency, params["urgency"]),
-        severity: enum(:severity, params["severity"]),
-        certainty: enum(:certainty, params["certainty"]),
-        headline: params["headline"],
-        description: params["description"],
-        instruction: params["instruction"],
-        area_description: params["area_description"],
-        geocodes: params["geocodes"] || [],
-        effective_at: parse_dt(params["effective_at"]),
-        onset_at: parse_dt(params["onset_at"]),
-        expires_at: parse_dt(params["expires_at"]),
         extensions: params["extensions"] || %{}
       }
 
-    attrs = if mode == :partial, do: drop_nil(attrs), else: attrs
+    envelope = if mode == :partial, do: drop_nil(envelope), else: envelope
+
+    attrs =
+      case params["infos"] do
+        infos when is_list(infos) -> Map.put(envelope, :infos, Enum.map(infos, &cast_info/1))
+        _ -> envelope
+      end
+
     {:ok, attrs}
   end
 
+  defp cast_info(info) do
+    %{
+      "language" => info["language"] || "zh-CN",
+      "category" => enum(:category, info["category"]),
+      "event" => info["event"],
+      "urgency" => enum(:urgency, info["urgency"]),
+      "severity" => enum(:severity, info["severity"]),
+      "certainty" => enum(:certainty, info["certainty"]),
+      "headline" => info["headline"],
+      "description" => info["description"],
+      "instruction" => info["instruction"],
+      "area_description" => info["area_description"],
+      "geocodes" => info["geocodes"] || [],
+      "effective_at" => parse_dt(info["effective_at"]),
+      "onset_at" => parse_dt(info["onset_at"]),
+      "expires_at" => parse_dt(info["expires_at"]),
+      "extensions" => info["extensions"] || %{}
+    }
+  end
+
+  # Correction/cancellation overrides: either explicit `infos`, or region-keyed
+  # severity/headline/description maps that the domain uses to split regions.
   defp cast_overrides(nil), do: {:ok, %{}}
 
   defp cast_overrides(overrides) when is_map(overrides) do
-    {:ok, drop_nil(elem(cast_content(overrides, :partial), 1))}
+    result =
+      %{}
+      |> put_if_present(:region_severities, overrides["region_severities"])
+      |> put_if_present(:region_headlines, overrides["region_headlines"])
+      |> put_if_present(:region_descriptions, overrides["region_descriptions"])
+
+    result =
+      case overrides["infos"] do
+        infos when is_list(infos) -> Map.put(result, :infos, Enum.map(infos, &cast_info/1))
+        _ -> result
+      end
+
+    {:ok, result}
   end
+
+  defp put_if_present(map, _key, nil), do: map
+  defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
   defp drop_nil(map), do: Enum.reject(map, fn {_k, v} -> is_nil(v) end) |> Map.new()
 
@@ -244,21 +276,32 @@ defmodule CapWorkbenchWeb.Api.MessageController do
       version_number: v.version_number,
       review_state: v.review_state,
       published: v.published,
-      headline: v.headline,
-      description: v.description,
-      instruction: v.instruction,
-      event: v.event,
-      category: v.category,
-      urgency: v.urgency,
-      severity: v.severity,
-      certainty: v.certainty,
-      language: v.language,
-      area_description: v.area_description,
-      geocodes: v.geocodes,
       extensions: v.extensions,
+      infos: Enum.map(v.infos, &info_json/1),
       reviewed_by: v.reviewed_by,
       reviewed_at: v.reviewed_at,
       published_at: v.published_at
+    }
+  end
+
+  defp info_json(info) do
+    %{
+      id: info.id,
+      language: info.language,
+      category: info.category,
+      event: info.event,
+      urgency: info.urgency,
+      severity: info.severity,
+      certainty: info.certainty,
+      headline: info.headline,
+      description: info.description,
+      instruction: info.instruction,
+      area_description: info.area_description,
+      geocodes: info.geocodes,
+      extensions: info.extensions,
+      effective_at: info.effective_at,
+      onset_at: info.onset_at,
+      expires_at: info.expires_at
     }
   end
 end

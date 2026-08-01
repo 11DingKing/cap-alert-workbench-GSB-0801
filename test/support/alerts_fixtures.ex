@@ -4,7 +4,7 @@ defmodule CapWorkbench.AlertsFixtures do
   """
   alias CapWorkbench.Alerts
 
-  @doc "Valid attrs for a brand new暴雨 draft, matching the seeded shape."
+  @doc "Valid attrs for a brand new暴雨 draft with a single info block covering both regions."
   def valid_attrs(overrides \\ %{}) do
     %{
       identifier: "CN-#{System.unique_integer([:positive])}-GD-RAIN-TST",
@@ -13,19 +13,27 @@ defmodule CapWorkbench.AlertsFixtures do
       status: :actual,
       msg_type: :alert,
       scope: :public,
-      language: "zh-CN",
-      category: :met,
-      event: "暴雨与强对流天气",
-      urgency: :immediate,
-      severity: :severe,
-      certainty: :likely,
-      headline: "暴雨红色预警",
-      description: "预计未来6小时出现暴雨到大暴雨。",
-      instruction: "转移低洼地带人员。",
-      area_description: "揭阳市、茂名市",
-      geocodes: ["440800", "440900"],
-      effective_at: ~U[2026-07-29 08:00:00.000000Z],
-      expires_at: ~U[2026-07-29 14:00:00.000000Z]
+      infos: [valid_info()]
+    }
+    |> Map.merge(Map.new(overrides))
+  end
+
+  @doc "A valid single info block covering 440800 + 440900 at Severe."
+  def valid_info(overrides \\ %{}) do
+    %{
+      "language" => "zh-CN",
+      "category" => :met,
+      "event" => "暴雨与强对流天气",
+      "urgency" => :immediate,
+      "severity" => :severe,
+      "certainty" => :likely,
+      "headline" => "暴雨红色预警",
+      "description" => "预计未来6小时出现暴雨到大暴雨。",
+      "instruction" => "转移低洼地带人员。",
+      "area_description" => "揭阳市、茂名市",
+      "geocodes" => ["440800", "440900"],
+      "effective_at" => ~U[2026-07-29 08:00:00.000000Z],
+      "expires_at" => ~U[2026-07-29 14:00:00.000000Z]
     }
     |> Map.merge(Map.new(overrides))
   end

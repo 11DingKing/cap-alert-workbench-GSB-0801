@@ -26,8 +26,9 @@ defmodule CapWorkbench.Cap.XmlTest do
     test "escapes special characters instead of concatenating raw" do
       message =
         message_fixture(%{
-          headline: "暴雨 & 大风 <紧急> \"红色\"",
-          description: "a < b & c > d"
+          infos: [
+            valid_info(%{"headline" => "暴雨 & 大风 <紧急> \"红色\"", "description" => "a < b & c > d"})
+          ]
         })
 
       version = Alerts.latest_version(message)
@@ -40,8 +41,9 @@ defmodule CapWorkbench.Cap.XmlTest do
       refute xml =~ "<紧急>"
       # And it must round-trip back to the exact original text.
       assert {:ok, parsed} = Xml.decode(xml)
-      assert parsed.version.headline == "暴雨 & 大风 <紧急> \"红色\""
-      assert parsed.version.description == "a < b & c > d"
+      [info] = parsed.version.infos
+      assert info["headline"] == "暴雨 & 大风 <紧急> \"红色\""
+      assert info["description"] == "a < b & c > d"
     end
   end
 
@@ -56,13 +58,50 @@ defmodule CapWorkbench.Cap.XmlTest do
       assert parsed.message.status == :actual
       assert parsed.message.msg_type == :alert
       assert parsed.message.scope == :public
-      assert parsed.version.category == :met
-      assert parsed.version.urgency == :immediate
-      assert parsed.version.severity == :severe
-      assert parsed.version.certainty == :likely
-      assert parsed.version.geocodes == ["440800", "440900"]
-      assert parsed.version.headline == version.headline
-      assert parsed.version.description == version.description
+
+      [info] = parsed.version.infos
+      assert info["category"] == :met
+      assert info["urgency"] == :immediate
+      assert info["severity"] == :severe
+      assert info["certainty"] == :likely
+      assert info["geocodes"] == ["440800", "440900"]
+      assert info["headline"] == hd(version.infos).headline
+      assert info["description"] == hd(version.infos).description
+    end
+
+    test "multiple info blocks preserve per-region severity correspondence" do
+      # 440800 stays Severe; 440900 raised to Extreme — two distinct info blocks.
+      message =
+        message_fixture(%{
+          infos: [
+            valid_info(%{
+              "severity" => :severe,
+              "geocodes" => ["440800"],
+              "area_description" => "揭阳市"
+            }),
+            valid_info(%{
+              "severity" => :extreme,
+              "geocodes" => ["440900"],
+              "area_description" => "茂名市",
+              "headline" => "茂名暴雨特别严重"
+            })
+          ]
+        })
+
+      version = Alerts.latest_version(message)
+      xml = Xml.encode(message, version)
+
+      # Two <info> and two <area> segments must be emitted.
+      assert length(Regex.scan(~r/<info>/, xml)) == 2
+
+      assert {:ok, parsed} = Xml.decode(xml)
+      assert length(parsed.version.infos) == 2
+
+      by_geocode =
+        Map.new(parsed.version.infos, fn info -> {hd(info["geocodes"]), info["severity"]} end)
+
+      assert by_geocode["440800"] == :severe
+      assert by_geocode["440900"] == :extreme
     end
 
     test "handles namespace prefixes on elements" do
@@ -95,8 +134,9 @@ defmodule CapWorkbench.Cap.XmlTest do
       assert {:ok, parsed} = Xml.decode(xml)
       assert parsed.message.identifier == "CN-NS-001"
       assert parsed.message.status == :actual
-      assert parsed.version.certainty == :likely
-      assert parsed.version.geocodes == ["440900"]
+      [info] = parsed.version.infos
+      assert info["certainty"] == :likely
+      assert info["geocodes"] == ["440900"]
     end
 
     test "preserves unknown extension fields for round-trip export" do
@@ -132,7 +172,8 @@ defmodule CapWorkbench.Cap.XmlTest do
       assert [%{"name" => alert_ext}] = parsed.version.extensions["alert"]
       assert alert_ext =~ "customTopLevel"
 
-      info_ext = parsed.version.extensions["info"]
+      [info] = parsed.version.infos
+      info_ext = info["extensions"]["info"]
       assert Enum.any?(info_ext, &(&1["name"] =~ "parameter"))
 
       # Now persist + re-encode and confirm the extension survives export.

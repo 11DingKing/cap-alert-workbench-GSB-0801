@@ -68,15 +68,52 @@ defmodule CapWorkbenchWeb.MessageLiveTest do
       assert reloaded.workflow_state == :published
     end
 
-    test "published message shows correction/cancellation actions and hides editor form", %{
-      conn: conn
-    } do
+    test "published message exposes per-region correction on the publish tab and hides editor form",
+         %{
+           conn: conn
+         } do
       message = published_message_fixture()
       {:ok, view, _html} = live(conn, ~p"/messages/#{message.id}")
 
-      assert has_element?(view, "#correction-btn")
-      assert has_element?(view, "#cancellation-btn")
+      # Editor form is gone once frozen.
       refute has_element?(view, "#edit-form")
+      # Cancellation is a top-level action.
+      assert has_element?(view, "#cancellation-btn")
+
+      # The per-region correction UI lives on the publish/output tab.
+      view |> element("#tab-publish") |> render_click()
+      assert has_element?(view, "#correction-panel")
+      assert has_element?(view, "#correction-btn")
+      assert has_element?(view, "#region-sev-440800")
+      assert has_element?(view, "#region-sev-440900")
+    end
+
+    test "per-region correction from the UI splits 440900 to Extreme", %{conn: conn} do
+      message = published_message_fixture()
+      {:ok, view, _html} = live(conn, ~p"/messages/#{message.id}")
+
+      view |> element("#tab-publish") |> render_click()
+
+      # Raise only 440900 to Extreme.
+      view
+      |> element("#region-form-440900")
+      |> render_change(%{"geocode" => "440900", "severity" => "extreme"})
+
+      view |> element("#correction-btn") |> render_click()
+
+      correction =
+        Alerts.list_messages()
+        |> Enum.find(&(&1.references_message_id == message.id))
+
+      assert correction.identifier == message.identifier <> "-C1"
+
+      severities =
+        Alerts.latest_version(correction).infos
+        |> Enum.flat_map(fn info -> Enum.map(info.geocodes, &{&1, info.severity}) end)
+        |> Map.new()
+
+      assert severities["440800"] == :severe
+      assert severities["440900"] == :extreme
     end
 
     test "a change from another session live-syncs into an open workbench", %{conn: conn} do
@@ -84,7 +121,8 @@ defmodule CapWorkbenchWeb.MessageLiveTest do
       {:ok, view, _html} = live(conn, ~p"/messages/#{message.id}")
 
       # Another browser/session saves a new version, bumping lock + adding v2.
-      {:ok, _} = Alerts.save_new_version(message, %{"headline" => "其他人先改了"}, message.lock_version)
+      info_map = Alerts.info_to_map(hd(Alerts.latest_version(message).infos))
+      {:ok, _} = Alerts.save_new_version(message, %{"infos" => [info_map]}, message.lock_version)
 
       # The open LiveView is notified via PubSub and reloads, so it now reflects
       # the latest lock version and keeps page/version state consistent — the

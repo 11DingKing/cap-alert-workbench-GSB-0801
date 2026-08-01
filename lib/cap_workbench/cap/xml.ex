@@ -18,7 +18,7 @@ defmodule CapWorkbench.Cap.Xml do
   round-trip retains extension fields the workbench does not itself model.
   """
 
-  alias CapWorkbench.Cap.{AlertMessage, DraftVersion, Enums}
+  alias CapWorkbench.Cap.{AlertMessage, DraftVersion, Enums, InfoBlock}
 
   @cap_ns "urn:oasis:names:tc:emergency:cap:1.2"
 
@@ -30,6 +30,9 @@ defmodule CapWorkbench.Cap.Xml do
 
   @doc """
   Serializes a persisted `%AlertMessage{}` + `%DraftVersion{}` into CAP 1.2 XML.
+
+  A version may carry several info blocks; each becomes its own `<info>` element
+  (in order), so per-region severity/headline/description are preserved.
 
   Every constrained value is rendered via `Enums.to_cap_token/1`; unknown atoms
   would raise rather than emit an unvalidated string.
@@ -59,45 +62,46 @@ defmodule CapWorkbench.Cap.Xml do
         ref -> [element("references", [], [text(ref)])]
       end
 
+    info_elements = Enum.map(version.infos, &info_element/1)
     alert_extensions = extension_elements(version.extensions, "alert")
 
-    base ++ references ++ [info_element(message, version)] ++ alert_extensions
+    base ++ references ++ info_elements ++ alert_extensions
   end
 
-  defp info_element(_message, version) do
+  defp info_element(%InfoBlock{} = info) do
     children =
       [
-        element("language", [], [text(version.language)]),
-        element("category", [], [text(Enums.to_cap_token(version.category))]),
-        element("event", [], [text(version.event)]),
-        element("urgency", [], [text(Enums.to_cap_token(version.urgency))]),
-        element("severity", [], [text(Enums.to_cap_token(version.severity))]),
-        element("certainty", [], [text(Enums.to_cap_token(version.certainty))])
+        element("language", [], [text(info.language)]),
+        element("category", [], [text(Enums.to_cap_token(info.category))]),
+        element("event", [], [text(info.event)]),
+        element("urgency", [], [text(Enums.to_cap_token(info.urgency))]),
+        element("severity", [], [text(Enums.to_cap_token(info.severity))]),
+        element("certainty", [], [text(Enums.to_cap_token(info.certainty))])
       ] ++
-        optional_dt("effective", version.effective_at) ++
-        optional_dt("onset", version.onset_at) ++
-        optional_dt("expires", version.expires_at) ++
+        optional_dt("effective", info.effective_at) ++
+        optional_dt("onset", info.onset_at) ++
+        optional_dt("expires", info.expires_at) ++
         [
-          element("headline", [], [text(version.headline)]),
-          element("description", [], [text(version.description)])
+          element("headline", [], [text(info.headline)]),
+          element("description", [], [text(info.description)])
         ] ++
-        optional_text("instruction", version.instruction) ++
-        [area_element(version)] ++
-        extension_elements(version.extensions, "info")
+        optional_text("instruction", info.instruction) ++
+        [area_element(info)] ++
+        extension_elements(info.extensions, "info")
 
     element("info", [], children)
   end
 
-  defp area_element(version) do
+  defp area_element(%InfoBlock{} = info) do
     geocodes =
-      Enum.map(version.geocodes, fn code ->
+      Enum.map(info.geocodes, fn code ->
         element("geocode", [], [
           element("valueName", [], [text("SAME")]),
           element("value", [], [text(code)])
         ])
       end)
 
-    element("area", [], [element("areaDesc", [], [text(version.area_description)]) | geocodes])
+    element("area", [], [element("areaDesc", [], [text(info.area_description)]) | geocodes])
   end
 
   defp optional_text(_name, nil), do: []
@@ -176,20 +180,17 @@ defmodule CapWorkbench.Cap.Xml do
 
   defp interpret({alert_name, _attrs, children}) do
     if local_name(alert_name) == "alert" do
-      info = find_child(children, "info")
+      info_nodes = all_children(children, "info")
 
-      case info do
-        nil ->
+      case info_nodes do
+        [] ->
           {:error, :missing_info}
 
-        {_n, _a, info_children} ->
+        _ ->
           with {:ok, status} <- token(children, "status", :status),
                {:ok, msg_type} <- token(children, "msgType", :msg_type),
                {:ok, scope} <- token(children, "scope", :scope),
-               {:ok, category} <- token(info_children, "category", :category),
-               {:ok, urgency} <- token(info_children, "urgency", :urgency),
-               {:ok, severity} <- token(info_children, "severity", :severity),
-               {:ok, certainty} <- token(info_children, "certainty", :certainty) do
+               {:ok, infos} <- interpret_infos(info_nodes) do
             message = %{
               identifier: text_of(children, "identifier"),
               sender: text_of(children, "sender"),
@@ -201,23 +202,9 @@ defmodule CapWorkbench.Cap.Xml do
             }
 
             version = %{
-              language: text_of(info_children, "language") || "zh-CN",
-              category: category,
-              event: text_of(info_children, "event"),
-              urgency: urgency,
-              severity: severity,
-              certainty: certainty,
-              effective_at: parse_dt(text_of(info_children, "effective")),
-              onset_at: parse_dt(text_of(info_children, "onset")),
-              expires_at: parse_dt(text_of(info_children, "expires")),
-              headline: text_of(info_children, "headline"),
-              description: text_of(info_children, "description"),
-              instruction: text_of(info_children, "instruction"),
-              area_description: area_desc(info_children),
-              geocodes: geocodes(info_children),
+              infos: infos,
               extensions: %{
-                "alert" => unknown_children(children, @known_alert_children),
-                "info" => unknown_children(info_children, @known_info_children)
+                "alert" => unknown_children(children, @known_alert_children)
               }
             }
 
@@ -231,6 +218,48 @@ defmodule CapWorkbench.Cap.Xml do
 
   defp interpret(_), do: {:error, :not_a_cap_alert}
 
+  # Interprets every <info> node in order, short-circuiting on the first error.
+  defp interpret_infos(info_nodes) do
+    Enum.reduce_while(info_nodes, {:ok, []}, fn {_n, _a, info_children}, {:ok, acc} ->
+      case interpret_info(info_children) do
+        {:ok, info} -> {:cont, {:ok, [info | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, list} -> {:ok, Enum.reverse(list)}
+      error -> error
+    end
+  end
+
+  defp interpret_info(info_children) do
+    with {:ok, category} <- token(info_children, "category", :category),
+         {:ok, urgency} <- token(info_children, "urgency", :urgency),
+         {:ok, severity} <- token(info_children, "severity", :severity),
+         {:ok, certainty} <- token(info_children, "certainty", :certainty) do
+      {:ok,
+       %{
+         "language" => text_of(info_children, "language") || "zh-CN",
+         "category" => category,
+         "event" => text_of(info_children, "event"),
+         "urgency" => urgency,
+         "severity" => severity,
+         "certainty" => certainty,
+         "effective_at" => parse_dt(text_of(info_children, "effective")),
+         "onset_at" => parse_dt(text_of(info_children, "onset")),
+         "expires_at" => parse_dt(text_of(info_children, "expires")),
+         "headline" => text_of(info_children, "headline"),
+         "description" => text_of(info_children, "description"),
+         "instruction" => text_of(info_children, "instruction"),
+         "area_description" => area_desc(info_children),
+         "geocodes" => geocodes(info_children),
+         "extensions" => %{
+           "info" => unknown_children(info_children, @known_info_children)
+         }
+       }}
+    end
+  end
+
   # --- helpers for reading the simple-form tree ------------------------------
 
   # CAP elements may carry namespace prefixes; compare on the local part.
@@ -243,6 +272,14 @@ defmodule CapWorkbench.Cap.Xml do
 
   defp find_child(children, name) do
     Enum.find(children, fn
+      {n, _a, _c} -> local_name(n) == name
+      _ -> false
+    end)
+  end
+
+  # Returns every element child with the given local name, in document order.
+  defp all_children(children, name) do
+    Enum.filter(children, fn
       {n, _a, _c} -> local_name(n) == name
       _ -> false
     end)

@@ -41,6 +41,20 @@
 - 转义完全交由编码器完成，**round-trip 不会**把 `&amp;` 变成 `&amp;amp;`（见测试）。
 - 未知 / 前向兼容的扩展字段（alert 级与 info 级）被保存在 `extensions` 中，导出时原样还原。
 
+### 多 info 段与按地区更正
+
+- 一份文档可包含多个 CAP `<info>` 段，每段有各自的 `<area>`、`severity`、`headline`、`description`
+  （内嵌 `InfoBlock`，见 [`info_block.ex`](lib/cap_workbench/cap/info_block.ex)）。
+- 更正按地区进行：值班员为每个地区选择目标严重度，领域层把严重度变化的地区拆分为独立 info 段。
+  例如首轮文档 440800 与 440900 同为 `Severe`，更正 `CN-20260729-GD-RAIN-001-C1` 后
+  440900 升为 `Extreme`、440800 保持 `Severe`，输出为两个 `<info>` 段。
+- 更正只能从**最新已发布**文档派生；`references` 精确指向被更正的文档
+  （`sender,identifier,sent`）。
+- 更正标识是确定性的（`-C1` / 解除 `-X1`）且 `identifier` 唯一，因此派生是**幂等**的：
+  重复点击、并发请求、旧锁重试都不会产生第二份 C1 或第二条 outbox（先做存在性检查，唯一索引兜底）。
+- LiveView「版本差异」页**按地区**展示变化（新增 / 移除 / 变更 / 未变）。
+- 多 info 段 XML 导入导出 round-trip 后，地区 ↔ 严重度对应关系保持不变（见测试）。
+
 ---
 
 ## 2. 环境要求

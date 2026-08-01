@@ -25,7 +25,28 @@ defmodule CapWorkbenchWeb.Api.MessageControllerTest do
 
   describe "workflow endpoints" do
     test "create -> submit -> review -> publish", %{conn: conn} do
-      attrs = valid_attrs() |> Map.new(fn {k, v} -> {Atom.to_string(k), stringify(v)} end)
+      attrs = %{
+        "identifier" => "CN-API-#{System.unique_integer([:positive])}",
+        "sender" => "cap@gd.gov.cn",
+        "sent_at" => "2026-07-29T08:00:00Z",
+        "status" => "actual",
+        "msg_type" => "alert",
+        "scope" => "public",
+        "infos" => [
+          %{
+            "language" => "zh-CN",
+            "category" => "met",
+            "event" => "暴雨",
+            "urgency" => "immediate",
+            "severity" => "severe",
+            "certainty" => "likely",
+            "headline" => "标题",
+            "description" => "描述",
+            "area_description" => "揭阳、茂名",
+            "geocodes" => ["440800", "440900"]
+          }
+        ]
+      }
 
       conn = post(conn, ~p"/api/messages", %{"message" => attrs})
       assert %{"data" => created} = json_response(conn, 201)
@@ -57,6 +78,29 @@ defmodule CapWorkbenchWeb.Api.MessageControllerTest do
 
       assert %{"data" => published} = json_response(conn, 200)
       assert published["workflow_state"] == "published"
+      assert [%{"infos" => [%{"severity" => "severe"}]} | _] = published["versions"]
+    end
+
+    test "per-region correction via API splits 440900 to Extreme", %{conn: conn} do
+      published = published_message_fixture()
+
+      conn =
+        post(conn, ~p"/api/messages/#{published.id}/correction", %{
+          "overrides" => %{"region_severities" => %{"440900" => "extreme"}}
+        })
+
+      assert %{"data" => correction} = json_response(conn, 201)
+      assert correction["identifier"] == published.identifier <> "-C1"
+
+      severities =
+        correction["versions"]
+        |> List.first()
+        |> Map.get("infos")
+        |> Enum.flat_map(fn info -> Enum.map(info["geocodes"], &{&1, info["severity"]}) end)
+        |> Map.new()
+
+      assert severities["440800"] == "severe"
+      assert severities["440900"] == "extreme"
     end
 
     test "duplicate publish returns 409 conflict", %{conn: conn} do
@@ -73,11 +117,12 @@ defmodule CapWorkbenchWeb.Api.MessageControllerTest do
     test "stale lock version returns 409 conflict on save", %{conn: conn} do
       message = message_fixture()
       stale = message.lock_version
-      {:ok, _} = Alerts.save_new_version(message, %{"headline" => "先手"}, stale)
+      info_map = CapWorkbench.Alerts.info_to_map(hd(Alerts.latest_version(message).infos))
+      {:ok, _} = Alerts.save_new_version(message, %{"infos" => [info_map]}, stale)
 
       conn =
         post(conn, ~p"/api/messages/#{message.id}/versions", %{
-          "version" => %{"headline" => "后手"},
+          "version" => %{"infos" => [%{"headline" => "后手"}]},
           "lock_version" => stale
         })
 
@@ -116,8 +161,4 @@ defmodule CapWorkbenchWeb.Api.MessageControllerTest do
       assert %{"error" => %{"code" => "doctype_forbidden"}} = json_response(conn, 422)
     end
   end
-
-  defp stringify(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
-  defp stringify(atom) when is_atom(atom) and not is_nil(atom), do: Atom.to_string(atom)
-  defp stringify(other), do: other
 end

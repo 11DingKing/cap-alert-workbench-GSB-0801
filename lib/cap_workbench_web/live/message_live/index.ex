@@ -87,17 +87,23 @@ defmodule CapWorkbenchWeb.MessageLive.Index do
       status: to_enum(params["status"]),
       msg_type: to_enum(params["msg_type"]),
       scope: to_enum(params["scope"]),
-      language: params["language"] || "zh-CN",
-      category: to_enum(params["category"]),
-      event: params["event"],
-      urgency: to_enum(params["urgency"]),
-      severity: to_enum(params["severity"]),
-      certainty: to_enum(params["certainty"]),
-      headline: params["headline"],
-      description: params["description"],
-      instruction: params["instruction"],
-      area_description: params["area_description"],
-      geocodes: split_geocodes(params["geocodes"])
+      # The new-draft form captures a single info block covering the given
+      # regions; the workbench editor can later split into multiple blocks.
+      infos: [
+        %{
+          "language" => params["language"] || "zh-CN",
+          "category" => params["category"],
+          "event" => params["event"],
+          "urgency" => params["urgency"],
+          "severity" => params["severity"],
+          "certainty" => params["certainty"],
+          "headline" => params["headline"],
+          "description" => params["description"],
+          "instruction" => params["instruction"],
+          "area_description" => params["area_description"],
+          "geocodes" => split_geocodes(params["geocodes"])
+        }
+      ]
     }
   end
 
@@ -107,13 +113,7 @@ defmodule CapWorkbenchWeb.MessageLive.Index do
   defp to_enum(""), do: nil
 
   defp to_enum(value) do
-    all =
-      Enums.statuses() ++
-        Enums.msg_types() ++
-        Enums.scopes() ++
-        Enums.categories() ++
-        Enums.urgencies() ++ Enums.severities() ++ Enums.certainties()
-
+    all = Enums.statuses() ++ Enums.msg_types() ++ Enums.scopes()
     Enum.find(all, fn atom -> Atom.to_string(atom) == value end)
   end
 

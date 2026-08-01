@@ -33,6 +33,7 @@ defmodule CapWorkbench.Alerts do
     AuditEvent,
     DraftVersion,
     Enums,
+    InfoBlock,
     OutboxEntry,
     StateMachine,
     Xml
@@ -396,63 +397,160 @@ defmodule CapWorkbench.Alerts do
   # --- Use cases: corrections and cancellations ------------------------------
 
   @doc """
-  Creates a correction (`:update`) draft derived from a published message.
+  Creates a correction (`:update`) draft derived from the latest published
+  message.
 
-  The new message references the published one via a stable CAP `references`
-  string and its own `references_message_id`. Content is seeded from the
-  published version and can then go through the normal review/publish flow.
+  `overrides` may contain:
+
+    * `:infos` — an explicit list of info-block maps to use verbatim, or
+    * `:region_severities` — a map of `geocode => severity` used to split the
+      source area into per-region info blocks (a region whose severity differs
+      from its neighbours becomes its own `<info>`), plus optional
+      `:region_headlines` / `:region_descriptions` overrides keyed by geocode.
+
+  The correction references the source message exactly (stable
+  `references_message_id` + CAP `references` text) and is assigned a
+  deterministic identifier (`<base>-C<n>`). Because that identifier is unique,
+  creation is idempotent: concurrent attempts, stale locks, or repeated clicks
+  can never produce a second `-C1`.
   """
-  def create_correction(%AlertMessage{} = published, overrides, actor \\ "system") do
-    derive(published, :update, :correction_created, overrides, actor)
+  def create_correction(%AlertMessage{} = source, overrides \\ %{}, actor \\ "system") do
+    derive(source, :update, :correction_created, overrides, actor)
   end
 
   @doc """
-  Creates a cancellation (`:cancel`) draft derived from a published message.
+  Creates a cancellation (`:cancel`) draft derived from the latest published
+  message. Idempotent on its deterministic identifier, like corrections.
   """
-  def create_cancellation(%AlertMessage{} = published, overrides, actor \\ "system") do
-    derive(published, :cancel, :cancellation_created, overrides, actor)
+  def create_cancellation(%AlertMessage{} = source, overrides \\ %{}, actor \\ "system") do
+    derive(source, :cancel, :cancellation_created, overrides, actor)
   end
 
-  defp derive(%AlertMessage{} = published, msg_type, audit_action, overrides, actor) do
-    with true <- StateMachine.can_derive?(published) || {:error, :not_published} do
-      published = Repo.preload(published, versions: version_order())
-      source = published_version(published) || List.last(published.versions)
+  defp derive(%AlertMessage{} = source, msg_type, audit_action, overrides, actor) do
+    with true <- StateMachine.can_derive?(source) || {:error, :not_published} do
+      source = Repo.preload(source, versions: version_order())
+      source_version = published_version(source) || List.last(source.versions)
+      identifier = correction_identifier(source.identifier, msg_type)
+
+      overrides = Map.new(overrides)
+      infos = build_correction_infos(source_version, overrides)
+
+      version_attrs = %{"infos" => infos, "extensions" => source_version.extensions}
 
       message_attrs = %{
-        identifier: new_identifier(published.identifier, msg_type),
-        sender: published.sender,
+        identifier: identifier,
+        sender: source.sender,
         sent_at: DateTime.utc_now(),
-        status: published.status,
+        status: source.status,
         msg_type: msg_type,
-        scope: published.scope,
-        references_text: cap_reference(published),
-        references_message_id: published.id
+        scope: source.scope,
+        references_text: cap_reference(source),
+        references_message_id: source.id
       }
 
-      version_attrs =
-        source
-        |> Map.take(~w(headline description instruction event category urgency severity
-                       certainty language effective_at onset_at expires_at
-                       area_description geocodes extensions)a)
-        |> Map.merge(Map.new(overrides))
+      # Idempotency guard: if a derivation with this deterministic identifier
+      # already exists, return it instead of inserting a duplicate. The unique
+      # index on `identifier` is the ultimate backstop under a race.
+      case Repo.get_by(AlertMessage, identifier: identifier) do
+        %AlertMessage{} = existing ->
+          {:ok, get_message!(existing.id)}
 
-      Multi.new()
-      |> Multi.insert(:message, AlertMessage.create_changeset(%AlertMessage{}, message_attrs))
-      |> Multi.insert(:version, fn %{message: message} ->
-        DraftVersion.content_changeset(%DraftVersion{}, version_attrs, %{
-          version_number: 1,
-          alert_message_id: message.id,
-          created_by: actor
-        })
-      end)
-      |> Multi.insert(:audit, fn %{message: message, version: version} ->
-        audit(message, version, audit_action, actor, nil, "drafting")
-      end)
-      |> transact()
-      |> normalize_multi(:message)
-      |> notify(:derived)
+        nil ->
+          Multi.new()
+          |> Multi.insert(:message, AlertMessage.create_changeset(%AlertMessage{}, message_attrs))
+          |> Multi.insert(:version, fn %{message: message} ->
+            DraftVersion.content_changeset(%DraftVersion{}, version_attrs, %{
+              version_number: 1,
+              alert_message_id: message.id,
+              created_by: actor
+            })
+          end)
+          |> Multi.insert(:audit, fn %{message: message, version: version} ->
+            audit(message, version, audit_action, actor, nil, "drafting")
+          end)
+          |> transact()
+          |> normalize_multi(:message)
+          |> translate_identifier_clash(identifier)
+          |> notify(:derived)
+      end
     else
       {:error, _} = error -> error
+    end
+  end
+
+  # Builds the info blocks for a correction. If the caller supplies explicit
+  # `:infos`, use them. Otherwise, if `:region_severities` is given, split the
+  # source's info blocks so each region carries its own severity (and optional
+  # headline/description), preserving regions not mentioned.
+  defp build_correction_infos(_source_version, %{infos: infos}) when is_list(infos), do: infos
+  defp build_correction_infos(_source_version, %{"infos" => infos}) when is_list(infos), do: infos
+
+  defp build_correction_infos(source_version, overrides) do
+    region_severities = normalize_region_map(Map.get(overrides, :region_severities, %{}))
+    region_headlines = normalize_region_map(Map.get(overrides, :region_headlines, %{}))
+    region_descriptions = normalize_region_map(Map.get(overrides, :region_descriptions, %{}))
+
+    source_version.infos
+    |> Enum.flat_map(fn info ->
+      split_info_by_region(info, region_severities, region_headlines, region_descriptions)
+    end)
+  end
+
+  # Splits a single info block into one block per geocode when any of that
+  # block's regions has an override; regions sharing the same (possibly
+  # overridden) values are regrouped so unchanged regions stay together.
+  defp split_info_by_region(info, sev, head, desc) do
+    touched? = Enum.any?(info.geocodes, &Map.has_key?(sev, &1))
+
+    if touched? do
+      info.geocodes
+      |> Enum.group_by(fn geo ->
+        {Map.get(sev, geo, info.severity), Map.get(head, geo), Map.get(desc, geo)}
+      end)
+      |> Enum.map(fn {{severity, headline, description}, geocodes} ->
+        base = info_to_map(info)
+
+        base
+        |> Map.put("severity", severity)
+        |> Map.put("geocodes", geocodes)
+        |> maybe_put("headline", headline)
+        |> maybe_put("description", description)
+        |> maybe_put("area_description", region_area_desc(headline, geocodes, info))
+        |> Map.delete("id")
+      end)
+      # Keep a stable order: highest severity first, then original geocode order.
+      |> Enum.sort_by(fn m -> severity_rank(m["severity"]) end)
+    else
+      [info_to_map(info) |> Map.delete("id")]
+    end
+  end
+
+  defp region_area_desc(nil, geocodes, info) do
+    # When no explicit headline/area override, describe by the geocodes carved out.
+    if geocodes == info.geocodes, do: info.area_description, else: Enum.join(geocodes, "、")
+  end
+
+  defp region_area_desc(_headline, _geocodes, info), do: info.area_description
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  # Normalizes a region-keyed override map: keys to strings, severity values to
+  # known atoms (never String.to_atom on user input).
+  defp normalize_region_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), normalize_region_value(v)} end)
+  end
+
+  defp normalize_region_value(v) when is_atom(v), do: v
+
+  defp normalize_region_value(v) when is_binary(v) do
+    Enum.find(Enums.severities(), fn atom -> Atom.to_string(atom) == v end) || v
+  end
+
+  defp severity_rank(severity) do
+    case Enum.find_index(Enums.severities(), &(&1 == severity)) do
+      nil -> 99
+      idx -> idx
     end
   end
 
@@ -468,18 +566,59 @@ defmodule CapWorkbench.Alerts do
   end
 
   @doc """
-  Computes a structured, field-level diff between two versions for display.
-  Returns a list of `%{field:, from:, to:, changed?:}`.
+  Computes a per-region diff between two versions.
+
+  Each version's info blocks are flattened to a `geocode => attrs` map, then
+  compared region by region. Returns a list of
+  `%{geocode:, from:, to:, changes: [%{field:, from:, to:}], status:}` where
+  `status` is `:added`, `:removed`, `:changed`, or `:unchanged`.
   """
   def diff_versions(%DraftVersion{} = from, %DraftVersion{} = to) do
-    fields = ~w(headline description instruction event category urgency severity
-                certainty language area_description geocodes)a
+    from_regions = regions_by_geocode(from)
+    to_regions = regions_by_geocode(to)
 
-    Enum.map(fields, fn field ->
-      from_val = Map.get(from, field)
-      to_val = Map.get(to, field)
-      %{field: field, from: from_val, to: to_val, changed?: from_val != to_val}
+    geocodes =
+      (Map.keys(from_regions) ++ Map.keys(to_regions))
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    Enum.map(geocodes, fn geocode ->
+      from_attrs = Map.get(from_regions, geocode)
+      to_attrs = Map.get(to_regions, geocode)
+
+      {status, changes} = region_delta(from_attrs, to_attrs)
+
+      %{geocode: geocode, from: from_attrs, to: to_attrs, changes: changes, status: status}
     end)
+  end
+
+  @region_fields ~w(severity headline description event category urgency certainty
+                    language area_description instruction)a
+
+  # Flattens a version's info blocks into a map of geocode => comparable attrs.
+  defp regions_by_geocode(%DraftVersion{infos: infos}) do
+    Enum.reduce(infos, %{}, fn info, acc ->
+      attrs = Map.take(info, @region_fields)
+
+      Enum.reduce(info.geocodes, acc, fn geocode, inner ->
+        Map.put(inner, geocode, attrs)
+      end)
+    end)
+  end
+
+  defp region_delta(nil, _to), do: {:added, []}
+  defp region_delta(_from, nil), do: {:removed, []}
+
+  defp region_delta(from_attrs, to_attrs) do
+    changes =
+      @region_fields
+      |> Enum.map(fn field ->
+        {field, Map.get(from_attrs, field), Map.get(to_attrs, field)}
+      end)
+      |> Enum.filter(fn {_f, a, b} -> a != b end)
+      |> Enum.map(fn {field, a, b} -> %{field: field, from: a, to: b} end)
+
+    if changes == [], do: {:unchanged, []}, else: {:changed, changes}
   end
 
   # --- Internal helpers ------------------------------------------------------
@@ -529,12 +668,9 @@ defmodule CapWorkbench.Alerts do
     |> Kernel.+(1)
   end
 
-  @content_keys ~w(headline description instruction event category urgency severity
-                   certainty language effective_at onset_at expires_at
-                   area_description geocodes extensions)a
-
   # Snapshot the latest version's content as a string-keyed map to serve as the
-  # base for the next version.
+  # base for the next version. Info blocks are converted to plain maps so they
+  # can be re-cast through the embedded changeset.
   defp base_content(message) do
     message = Repo.preload(message, [versions: version_order()], force: true)
 
@@ -543,8 +679,36 @@ defmodule CapWorkbench.Alerts do
         %{}
 
       latest ->
-        Map.new(@content_keys, fn key -> {Atom.to_string(key), Map.get(latest, key)} end)
+        %{
+          "infos" => Enum.map(latest.infos, &info_to_map/1),
+          "extensions" => latest.extensions
+        }
     end
+  end
+
+  @doc """
+  Converts an `InfoBlock` struct to a plain string-keyed map (used both to seed
+  new versions and to build per-region views).
+  """
+  def info_to_map(%InfoBlock{} = info) do
+    %{
+      "id" => info.id,
+      "language" => info.language,
+      "category" => info.category,
+      "event" => info.event,
+      "urgency" => info.urgency,
+      "severity" => info.severity,
+      "certainty" => info.certainty,
+      "headline" => info.headline,
+      "description" => info.description,
+      "instruction" => info.instruction,
+      "effective_at" => info.effective_at,
+      "onset_at" => info.onset_at,
+      "expires_at" => info.expires_at,
+      "area_description" => info.area_description,
+      "geocodes" => info.geocodes,
+      "extensions" => info.extensions
+    }
   end
 
   defp stringify_keys(map) do
@@ -591,16 +755,28 @@ defmodule CapWorkbench.Alerts do
     Enum.join([message.sender, message.identifier, sent], ",")
   end
 
-  # Derive a stable identifier for a correction/cancellation from the original.
-  defp new_identifier(base_identifier, msg_type) do
-    suffix =
-      case msg_type do
-        :update -> "-UPD"
-        :cancel -> "-CANCEL"
-      end
+  # Deterministic identifier for a correction/cancellation. The suffix is fixed
+  # (`-C1` for the first correction, `-X1` for a cancellation) so that repeated
+  # derivations resolve to the SAME identifier and are therefore idempotent.
+  defp correction_identifier(base_identifier, :update), do: base_identifier <> "-C1"
+  defp correction_identifier(base_identifier, :cancel), do: base_identifier <> "-X1"
 
-    stamp = DateTime.utc_now() |> DateTime.to_unix()
-    base_identifier <> suffix <> "-" <> Integer.to_string(stamp)
+  # If two concurrent derivations race past the existence check, the unique
+  # index on `identifier` rejects the loser; surface the already-created row.
+  defp translate_identifier_clash({:error, %Ecto.Changeset{errors: errors}}, identifier) do
+    if Keyword.has_key?(errors, :identifier) do
+      {:ok, get_message_by_identifier!(identifier)}
+    else
+      {:error, %Ecto.Changeset{errors: errors}}
+    end
+  end
+
+  defp translate_identifier_clash(other, _identifier), do: other
+
+  defp get_message_by_identifier!(identifier) do
+    AlertMessage
+    |> Repo.get_by!(identifier: identifier)
+    |> then(&get_message!(&1.id))
   end
 
   # A losing optimistic-lock writer surfaces as a StaleEntryError from the

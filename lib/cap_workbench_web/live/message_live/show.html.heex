@@ -36,16 +36,9 @@
       </button>
       <button
         :if={can_derive?(@message)}
-        id="correction-btn"
-        phx-click="create_correction"
-        class="btn btn-sm btn-outline"
-      >
-        创建更正
-      </button>
-      <button
-        :if={can_derive?(@message)}
         id="cancellation-btn"
         phx-click="create_cancellation"
+        data-confirm="确认创建解除草稿？"
         class="btn btn-sm btn-outline btn-error"
       >
         创建解除
@@ -88,56 +81,176 @@
   >
     <%= if can_edit?(@message) do %>
       <p class="mb-4 text-sm text-base-content/70">
-        保存将创建一个新的不可变版本（当前最新为 v{@latest.version_number}）。若他人已同时修改，将检测到乐观锁冲突并要求重试。
+        保存将创建一个新的不可变版本（当前最新为 v{@latest.version_number}）。可包含多个 info 段，每段有各自的地区、严重度、标题与描述。
       </p>
-      <.form for={@form} id="edit-form" phx-change="validate" phx-submit="save_version">
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <.input field={@form[:event]} label="事件 (event)" />
-          <.input
-            field={@form[:category]}
-            type="select"
-            label="类别"
-            options={enum_options(:categories)}
-          />
-          <.input
-            field={@form[:urgency]}
-            type="select"
-            label="紧急度"
-            options={enum_options(:urgencies)}
-          />
-          <.input
-            field={@form[:severity]}
-            type="select"
-            label="严重度"
-            options={enum_options(:severities)}
-          />
-          <.input
-            field={@form[:certainty]}
-            type="select"
-            label="确定性"
-            options={enum_options(:certainties)}
-          />
-          <.input field={@form[:language]} label="语言" />
+      <div :if={@edit_errors != []} class="mb-4 rounded-md bg-error/10 p-3 text-sm text-error">
+        <div :for={err <- @edit_errors}>{err}</div>
+      </div>
+      <form id="edit-form" phx-change="validate" phx-submit="save_version">
+        <div class="space-y-4">
+          <div
+            :for={{info, idx} <- Enum.with_index(@info_drafts)}
+            id={"info-block-#{idx}"}
+            class="rounded-lg border border-base-300 p-4"
+          >
+            <div class="flex items-center justify-between mb-3">
+              <span class="badge badge-outline">info 段 {idx + 1}</span>
+              <button
+                :if={length(@info_drafts) > 1}
+                type="button"
+                id={"remove-info-#{idx}"}
+                phx-click="remove_info"
+                phx-value-index={idx}
+                class="btn btn-xs btn-ghost text-error"
+              >
+                移除
+              </button>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <label class="form-control">
+                <span class="label-text">事件 (event)</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][event]"}
+                  value={info["event"]}
+                  class="input input-bordered input-sm"
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text">类别</span>
+                <select
+                  name={"draft[infos][#{idx}][category]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:categories)}
+                    value={val}
+                    selected={val == info["category"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">严重度 (severity)</span>
+                <select
+                  name={"draft[infos][#{idx}][severity]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:severities)}
+                    value={val}
+                    selected={val == info["severity"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">紧急度</span>
+                <select
+                  name={"draft[infos][#{idx}][urgency]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:urgencies)}
+                    value={val}
+                    selected={val == info["urgency"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">确定性</span>
+                <select
+                  name={"draft[infos][#{idx}][certainty]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:certainties)}
+                    value={val}
+                    selected={val == info["certainty"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">语言</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][language]"}
+                  value={info["language"]}
+                  class="input input-bordered input-sm"
+                />
+              </label>
+            </div>
+            <label class="form-control mt-2">
+              <span class="label-text">标题 (headline)</span>
+              <input
+                type="text"
+                name={"draft[infos][#{idx}][headline]"}
+                value={info["headline"]}
+                class="input input-bordered input-sm"
+              />
+            </label>
+            <label class="form-control mt-2">
+              <span class="label-text">描述 (description)</span>
+              <textarea
+                name={"draft[infos][#{idx}][description]"}
+                rows="2"
+                class="textarea textarea-bordered"
+              >{info["description"]}</textarea>
+            </label>
+            <label class="form-control mt-2">
+              <span class="label-text">处置建议 (instruction)</span>
+              <textarea
+                name={"draft[infos][#{idx}][instruction]"}
+                rows="2"
+                class="textarea textarea-bordered"
+              >{info["instruction"]}</textarea>
+            </label>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+              <label class="form-control">
+                <span class="label-text">区域描述 (areaDesc)</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][area_description]"}
+                  value={info["area_description"]}
+                  class="input input-bordered input-sm"
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text">地区编码 (逗号分隔)</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][geocodes]"}
+                  value={info["geocodes"]}
+                  class="input input-bordered input-sm font-mono"
+                />
+              </label>
+            </div>
+          </div>
         </div>
-        <.input field={@form[:headline]} label="标题 (headline)" />
-        <.input field={@form[:description]} type="textarea" label="描述 (description)" />
-        <.input field={@form[:instruction]} type="textarea" label="处置建议 (instruction)" />
-        <.input field={@form[:area_description]} label="区域描述 (areaDesc)" />
-        <.input
-          field={@form[:geocodes]}
-          label="地区编码 (逗号分隔)"
-          value={render_value(@latest.geocodes)}
-        />
-        <div class="mt-4">
+        <div class="mt-4 flex gap-2">
+          <button
+            type="button"
+            id="add-info-btn"
+            phx-click="add_info"
+            class="btn btn-sm btn-outline"
+          >
+            + 增加 info 段
+          </button>
           <.button phx-disable-with="保存中…" class="btn btn-primary">保存为新版本</.button>
         </div>
-      </.form>
+      </form>
     <% else %>
       <div class="rounded-md bg-base-200 p-4 text-sm">
         该消息处于 <strong>{workflow_label(@message.workflow_state)}</strong>
         状态，内容已冻结，无法编辑。
         <%= if @message.workflow_state == :published do %>
-          如需变更，请使用右上角「创建更正」或「创建解除」。
+          如需变更，请前往「发布/输出」标签按地区「创建更正」，或右上角「创建解除」。
         <% end %>
       </div>
       <.version_readonly version={@latest} />
@@ -173,29 +286,43 @@
       </label>
     </form>
 
-    <table class="table table-sm" id="diff-table">
-      <thead>
-        <tr>
-          <th>字段</th>
-          <th>起点</th>
-          <th>终点</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr :for={row <- @diff} class={row.changed? && "bg-warning/10"}>
-          <td class="font-medium">{field_label(row.field)}</td>
-          <td class={[
-            "align-top whitespace-pre-wrap",
-            row.changed? && "text-error line-through/50"
-          ]}>
-            {render_value(row.from)}
-          </td>
-          <td class={["align-top whitespace-pre-wrap", row.changed? && "text-success font-medium"]}>
-            {render_value(row.to)}
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <p class="text-sm text-base-content/70 mb-2">按地区展示变化：</p>
+    <div class="space-y-3" id="diff-regions">
+      <div
+        :for={row <- @diff}
+        id={"diff-region-#{row.geocode}"}
+        class={[
+          "rounded-lg border p-3",
+          row.status == :changed && "border-warning bg-warning/5",
+          row.status == :added && "border-success bg-success/5",
+          row.status == :removed && "border-error bg-error/5",
+          row.status == :unchanged && "border-base-300"
+        ]}
+      >
+        <div class="flex items-center gap-2 mb-1">
+          <span class="font-mono font-medium">{row.geocode}</span>
+          <span class="badge badge-sm">{region_status_label(row.status)}</span>
+        </div>
+        <table :if={row.status == :changed} class="table table-xs">
+          <thead>
+            <tr>
+              <th>字段</th>
+              <th>起点</th>
+              <th>终点</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr :for={change <- row.changes}>
+              <td class="font-medium">{field_label(change.field)}</td>
+              <td class="text-error whitespace-pre-wrap">{render_value(change.from)}</td>
+              <td class="text-success font-medium whitespace-pre-wrap">
+                {render_value(change.to)}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   </div>
 
   <%!-- ================= REVIEW TAB ================= --%>
@@ -280,6 +407,51 @@
           Calendar.strftime(@published_version.published_at, "%Y-%m-%d %H:%M:%S")}。内容已冻结。
       </div>
       <.version_readonly version={@published_version} />
+
+      <%!-- Per-region correction: pick a target severity per geocode --%>
+      <div
+        :if={can_derive?(@message)}
+        class="mt-6 rounded-lg border border-base-300 p-4"
+        id="correction-panel"
+      >
+        <h4 class="font-semibold mb-2">按地区创建更正</h4>
+        <p class="text-sm text-base-content/70 mb-3">
+          为每个地区选择目标严重度；仅严重度变化的地区会拆分为独立 info 段（例如 440900 升为 Extreme，440800 保持 Severe）。
+        </p>
+        <div class="space-y-2">
+          <div
+            :for={{geocode, severity} <- Enum.sort(@region_severities)}
+            id={"region-row-#{geocode}"}
+            class="flex items-center gap-3"
+          >
+            <span class="font-mono w-24">{geocode}</span>
+            <form phx-change="set_region_severity" id={"region-form-#{geocode}"}>
+              <input type="hidden" name="geocode" value={geocode} />
+              <select
+                name="severity"
+                class="select select-bordered select-sm"
+                id={"region-sev-#{geocode}"}
+              >
+                <option
+                  :for={{label, val} <- enum_options(:severities)}
+                  value={val}
+                  selected={val == severity}
+                >
+                  {label}
+                </option>
+              </select>
+            </form>
+          </div>
+        </div>
+        <button
+          id="correction-btn"
+          phx-click="create_correction"
+          data-confirm="确认基于最新已发布文档创建更正？"
+          class="btn btn-sm btn-primary mt-3"
+        >
+          创建更正 (C1)
+        </button>
+      </div>
     <% else %>
       <%= if can_publish?(@message, @latest) do %>
         <div class="rounded-md bg-warning/10 p-4 text-sm">
