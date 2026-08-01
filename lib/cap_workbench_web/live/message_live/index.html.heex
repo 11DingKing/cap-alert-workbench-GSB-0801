@@ -1,0 +1,131 @@
+<Layouts.app flash={@flash}>
+  <div class="flex items-center justify-between">
+    <div>
+      <h1 class="text-2xl font-bold">预警编审工作台</h1>
+      <p class="text-sm text-base-content/70">
+        草稿编辑 → 复核 → 发布；发布后仅可更正或解除，原文不可修改。
+      </p>
+    </div>
+    <.link navigate={~p"/messages/new"} class="btn btn-primary" id="new-message-link">
+      <.icon name="hero-plus" class="size-4" /> 新建草稿
+    </.link>
+  </div>
+
+  <%= if @live_action == :new do %>
+    <div class="card border border-base-300 bg-base-100 p-6 shadow-sm">
+      <h2 class="text-lg font-semibold mb-4">新建预警草稿</h2>
+      <.form for={@form} id="new-message-form" phx-change="validate" phx-submit="create">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <.input field={@form[:identifier]} label="消息标识 (identifier)" required />
+          <.input
+            field={@form[:sender]}
+            label="发送方 (sender)"
+            value={CapWorkbench.Alerts.default_sender()}
+          />
+          <.input field={@form[:sent_at]} type="datetime-local" label="发送时间 (sent)" />
+          <.input
+            field={@form[:status]}
+            type="select"
+            label="状态 (status)"
+            options={enum_options(:statuses)}
+            value="actual"
+          />
+          <.input
+            field={@form[:msg_type]}
+            type="select"
+            label="消息类型 (msgType)"
+            options={enum_options(:msg_types)}
+            value="alert"
+          />
+          <.input
+            field={@form[:scope]}
+            type="select"
+            label="范围 (scope)"
+            options={enum_options(:scopes)}
+            value="public"
+          />
+          <.input field={@form[:language]} label="语言 (language)" value="zh-CN" />
+          <.input
+            field={@form[:category]}
+            type="select"
+            label="类别 (category)"
+            options={enum_options(:categories)}
+            value="met"
+          />
+          <.input
+            field={@form[:urgency]}
+            type="select"
+            label="紧急度 (urgency)"
+            options={enum_options(:urgencies)}
+            value="immediate"
+          />
+          <.input
+            field={@form[:severity]}
+            type="select"
+            label="严重度 (severity)"
+            options={enum_options(:severities)}
+            value="severe"
+          />
+          <.input
+            field={@form[:certainty]}
+            type="select"
+            label="确定性 (certainty)"
+            options={enum_options(:certainties)}
+            value="likely"
+          />
+          <.input field={@form[:event]} label="事件 (event)" />
+        </div>
+        <.input field={@form[:headline]} label="标题 (headline)" />
+        <.input field={@form[:description]} type="textarea" label="描述 (description)" />
+        <.input field={@form[:instruction]} type="textarea" label="处置建议 (instruction)" />
+        <.input field={@form[:area_description]} label="区域描述 (areaDesc)" />
+        <.input
+          field={@form[:geocodes]}
+          label="地区编码 (geocode，逗号分隔)"
+          placeholder="440800, 440900"
+        />
+        <div class="mt-4 flex gap-2">
+          <.button phx-disable-with="创建中…" class="btn btn-primary">创建草稿</.button>
+          <.link navigate={~p"/messages"} class="btn btn-ghost">取消</.link>
+        </div>
+      </.form>
+    </div>
+  <% end %>
+
+  <div class="overflow-x-auto rounded-lg border border-base-300">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>标识</th>
+          <th>类型</th>
+          <th>工作流状态</th>
+          <th>版本数</th>
+          <th>更新时间</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="messages">
+        <tr :for={message <- @messages} id={"message-#{message.id}"}>
+          <td class="font-mono text-sm">{message.identifier}</td>
+          <td>
+            <span class="badge badge-outline">{message.msg_type}</span>
+          </td>
+          <td>
+            <span class={["badge", workflow_badge(message.workflow_state)]}>
+              {workflow_label(message.workflow_state)}
+            </span>
+          </td>
+          <td>{length(message.versions)}</td>
+          <td class="text-sm text-base-content/70">
+            {Calendar.strftime(message.updated_at, "%Y-%m-%d %H:%M:%S")}
+          </td>
+          <td class="text-right">
+            <.link navigate={~p"/messages/#{message.id}"} class="btn btn-sm btn-outline">
+              打开
+            </.link>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</Layouts.app>
