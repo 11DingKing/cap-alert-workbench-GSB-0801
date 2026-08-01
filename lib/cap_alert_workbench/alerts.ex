@@ -455,24 +455,19 @@ defmodule CapAlertWorkbench.Alerts do
       source_version = Repo.get!(Version, latest_published.version_id)
       {:ok, source_doc} = Document.from_map(source_version.payload)
 
-      # 更正/解除标识从消息流稳定标识派生：-C1/-C2…（更正）、-X1…（解除）
+      # 后续消息（更正/解除）统一按已发布跟进文档数顺序编号：-C1、-C2…
+      # 第 1 轮更正为 -C1，其后的解除为 -C2，以此类推。
       followup_number =
         Repo.one!(
           from(p in PublishedDocument,
-            where: p.stream_id == ^stream_id and p.msg_type == ^msg_type,
+            where: p.stream_id == ^stream_id and p.msg_type in [:update, :cancel],
             select: count(p.id)
           )
         ) + 1
 
-      suffix =
-        case msg_type do
-          :update -> "-C#{followup_number}"
-          :cancel -> "-X#{followup_number}"
-        end
-
       followup_doc = %{
         source_doc
-        | identifier: stream.identifier <> suffix,
+        | identifier: stream.identifier <> "-C#{followup_number}",
           msg_type: msg_type,
           references: [
             %{

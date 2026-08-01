@@ -5,8 +5,9 @@
 
 一条 CAP 文档支持**多个 info 段**，每段独立携带 severity/urgency/certainty、
 headline/description 与 area（geocode），可表达「440800 维持 Severe、440900 升级
-Extreme」这类分地区预警。更正/解除消息标识从消息流稳定标识派生
-（`-C1`、`-C2`…更正，`-X1`…解除），`references` 精确指向其派生的已发布文档。
+Extreme」这类分地区预警。后续消息（更正/解除）标识从消息流稳定标识按顺序派生
+（`-C1`、`-C2`…），`references` 精确指向其派生的已发布文档；解除后完整版本链
+（首发 → 更正 → 解除）仍可查看，每次状态转换均有审计记录。
 
 技术栈：Elixir 1.20 / OTP 29、Phoenix 1.8、Phoenix LiveView、Ecto + PostgreSQL 17。
 

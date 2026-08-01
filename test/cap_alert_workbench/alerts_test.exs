@@ -459,28 +459,111 @@ defmodule CapAlertWorkbench.AlertsTest do
     end
   end
 
-  test "解除发布后消息流进入 cancelled，此后不能再更正" do
-    version = approved_version_fixture()
-    {:ok, _published} = Alerts.publish(version.id, "editor")
+  test "解除消息 C2：引用已发布 C1，保留多 info，版本链完整，重复发布幂等" do
+    # 第 1 轮：首发；第 2 轮：C1 更正（440800 Severe / 440900 Extreme）发布
+    %{version: v1, correction: correction} = correction_fixture()
 
-    {:ok, cancellation} = Alerts.start_cancellation(version.stream_id, "editor")
-    assert cancellation.msg_type == :cancel
+    {:ok, edited} =
+      Alerts.update_draft(
+        correction.id,
+        %{payload: split_infos_payload(correction.payload)},
+        correction.lock_version,
+        "editor"
+      )
 
-    {:ok, cancel_doc} = Document.from_map(cancellation.payload)
-    assert cancel_doc.identifier == "CN-20260729-GD-RAIN-001-X1"
-
-    {:ok, v} = Alerts.submit_for_review(cancellation.id, cancellation.lock_version, "editor")
+    {:ok, v} = Alerts.submit_for_review(edited.id, edited.lock_version, "editor")
     {:ok, v} = Alerts.decide_review(v.id, :approved, nil, "reviewer", v.lock_version)
-    {:ok, cancelled_doc} = Alerts.publish(v.id, "editor")
-    assert cancelled_doc.msg_type == :cancel
+    {:ok, published_c1} = Alerts.publish(v.id, "editor")
+    assert published_c1.identifier == "CN-20260729-GD-RAIN-001-C1"
 
-    stream = Repo.get_by!(Alerts.Stream, id: version.stream_id)
+    # 第 3 轮：解除消息 C2，引用第 2 轮已发布 C1
+    {:ok, cancellation} = Alerts.start_cancellation(v1.stream_id, "editor")
+    {:ok, cancel_doc} = Document.from_map(cancellation.payload)
+
+    assert cancel_doc.identifier == "CN-20260729-GD-RAIN-001-C2"
+    assert cancel_doc.msg_type == :cancel
+
+    # references 精确指向已发布 C1（标识 + sent 与冻结 XML 一致）
+    {:ok, c1_doc} = CapAlertWorkbench.Cap.Xml.parse(published_c1.cap_xml)
+
+    assert [%{identifier: "CN-20260729-GD-RAIN-001-C1", sent: ref_sent}] = cancel_doc.references
+    assert ref_sent == c1_doc.sent
+
+    # 保留多 info 解析结果：地区-严重度对应关系不变
+    [ci1, ci2] = cancel_doc.infos
+    assert Info.geocodes(ci1) == ["440800"]
+    assert ci1.severity == :severe
+    assert Info.geocodes(ci2) == ["440900"]
+    assert ci2.severity == :extreme
+
+    # C2 走完整编审流程后发布
+    {:ok, cv} = Alerts.submit_for_review(cancellation.id, cancellation.lock_version, "editor")
+    {:ok, cv} = Alerts.decide_review(cv.id, :approved, nil, "reviewer", cv.lock_version)
+    {:ok, published_c2} = Alerts.publish(cv.id, "editor")
+    assert published_c2.identifier == "CN-20260729-GD-RAIN-001-C2"
+    assert published_c2.msg_type == :cancel
+    assert published_c2.cap_xml =~ "<msgType>Cancel</msgType>"
+
+    assert published_c2.cap_xml =~
+             "<references>gd-moji@weather.gd.gov.cn,CN-20260729-GD-RAIN-001-C1,"
+
+    stream = Repo.get_by!(Alerts.Stream, id: v1.stream_id)
     assert stream.state == :cancelled
 
-    assert Repo.get_by!(OutboxEvent, version_id: v.id).type == :alert_cancelled
+    # 重复发布请求幂等：不产生第二份文档 / outbox / 审计
+    assert {:error, :already_published} = Alerts.publish(cv.id, "editor")
+    assert Repo.aggregate(PublishedDocument, :count) == 3
+    assert Repo.aggregate(from(a in AuditEvent, where: a.event == :published), :count) == 3
+    assert Repo.aggregate(OutboxEvent, :count) == 3
+    assert Repo.get_by!(OutboxEvent, version_id: cv.id).type == :alert_cancelled
+
+    # 解除后仍可查看完整版本链
+    {:ok, detail} = Alerts.get_stream_detail(v1.stream_id)
+
+    assert Enum.map(detail.versions, &{&1.version_number, &1.workflow, &1.msg_type}) == [
+             {1, :published, :alert},
+             {2, :published, :update},
+             {3, :published, :cancel}
+           ]
+
+    assert Enum.map(detail.published_documents, & &1.identifier) |> Enum.sort() == [
+             "CN-20260729-GD-RAIN-001",
+             "CN-20260729-GD-RAIN-001-C1",
+             "CN-20260729-GD-RAIN-001-C2"
+           ]
+
+    # 每次状态转换均有审计记录
+    events = Enum.map(detail.audit_events, & &1.event)
+
+    for expected <- [
+          :stream_created,
+          :submitted_for_review,
+          :review_approved,
+          :published,
+          :correction_started,
+          :cancellation_started
+        ] do
+      assert expected in events, "缺少审计事件 #{expected}"
+    end
+  end
+
+  test "解除后不能再发起更正/解除" do
+    %{version: v1, correction: correction} = correction_fixture()
+
+    {:ok, v} = Alerts.submit_for_review(correction.id, correction.lock_version, "editor")
+    {:ok, v} = Alerts.decide_review(v.id, :approved, nil, "reviewer", v.lock_version)
+    {:ok, _c1} = Alerts.publish(v.id, "editor")
+
+    {:ok, cancellation} = Alerts.start_cancellation(v1.stream_id, "editor")
+    {:ok, cv} = Alerts.submit_for_review(cancellation.id, cancellation.lock_version, "editor")
+    {:ok, cv} = Alerts.decide_review(cv.id, :approved, nil, "reviewer", cv.lock_version)
+    {:ok, _c2} = Alerts.publish(cv.id, "editor")
 
     assert {:error, {:invalid_transition, :cancelled, :start_followup}} =
-             Alerts.start_correction(version.stream_id, "editor")
+             Alerts.start_correction(v1.stream_id, "editor")
+
+    assert {:error, {:invalid_transition, :cancelled, :start_followup}} =
+             Alerts.start_cancellation(v1.stream_id, "editor")
   end
 
   test "存在活动草稿时不能重复发起更正/解除" do
