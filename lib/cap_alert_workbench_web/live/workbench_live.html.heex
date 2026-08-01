@@ -120,108 +120,206 @@
               :if={editable?(draft)}
               for={@draft_form}
               id="draft-form"
+              phx-change="form_changed"
               phx-submit="save_draft"
-              class="space-y-3"
+              class="space-y-4"
             >
               <input type="hidden" name="draft[lock_version]" value={draft.lock_version} />
               <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
-                <.input
-                  field={@draft_form[:event]}
-                  type="text"
-                  label="事件名称"
-                  id="draft-event"
-                />
-                <.input
-                  field={@draft_form[:headline]}
-                  type="text"
-                  label="标题"
-                  id="draft-headline"
-                />
-                <.input
-                  field={@draft_form[:language]}
-                  type="text"
-                  label="语言"
-                  id="draft-language"
-                />
+                <label class="block text-sm">
+                  <span class="mb-1 block text-zinc-600">状态 status</span>
+                  <select
+                    id="draft-status"
+                    name="draft[status]"
+                    class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                  >
+                    <option
+                      :for={option <- enum_options(:status)}
+                      value={option}
+                      selected={option == draft.payload["status"]}
+                    >
+                      {option}
+                    </option>
+                  </select>
+                </label>
               </div>
-              <div class="grid grid-cols-2 gap-3 md:grid-cols-5">
-                <.input
-                  field={@draft_form[:status]}
-                  type="select"
-                  label="状态 status"
-                  options={enum_options(:status)}
-                  id="draft-status"
-                />
-                <.input
-                  field={@draft_form[:category]}
-                  type="select"
-                  label="类别 category"
-                  options={enum_options(:category)}
-                  id="draft-category"
-                />
-                <.input
-                  field={@draft_form[:urgency]}
-                  type="select"
-                  label="紧急度 urgency"
-                  options={enum_options(:urgency)}
-                  id="draft-urgency"
-                />
-                <.input
-                  field={@draft_form[:severity]}
-                  type="select"
-                  label="严重度 severity"
-                  options={enum_options(:severity)}
-                  id="draft-severity"
-                />
-                <.input
-                  field={@draft_form[:certainty]}
-                  type="select"
-                  label="确定性 certainty"
-                  options={enum_options(:certainty)}
-                  id="draft-certainty"
-                />
+
+              <div
+                :for={{info, index} <- Enum.with_index(@draft_infos)}
+                id={"info-fieldset-#{index}"}
+                class="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3"
+              >
+                <div class="flex items-center justify-between">
+                  <h4 class="text-sm font-semibold text-zinc-700">
+                    info 段 {index + 1}
+                    <span
+                      :if={info["geocodes"] && info["geocodes"] != ""}
+                      class="ml-1 font-mono text-xs text-zinc-500"
+                    >
+                      （{info["geocodes"]}）
+                    </span>
+                  </h4>
+                  <button
+                    :if={length(@draft_infos) > 1}
+                    id={"btn-remove-info-#{index}"}
+                    type="submit"
+                    name="form_action"
+                    value={"remove_info:#{index}"}
+                    class="rounded-md border border-rose-300 px-2 py-0.5 text-xs text-rose-700 transition hover:bg-rose-50"
+                  >
+                    删除此段
+                  </button>
+                </div>
+                <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">事件名称</span>
+                    <input
+                      type="text"
+                      id={"draft-event-#{index}"}
+                      name={"draft[infos][#{index}][event]"}
+                      value={info["event"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">标题 headline</span>
+                    <input
+                      type="text"
+                      id={"draft-headline-#{index}"}
+                      name={"draft[infos][#{index}][headline]"}
+                      value={info["headline"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">语言</span>
+                    <input
+                      type="text"
+                      id={"draft-language-#{index}"}
+                      name={"draft[infos][#{index}][language]"}
+                      value={info["language"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                </div>
+                <div class="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">类别 category</span>
+                    <select
+                      id={"draft-category-#{index}"}
+                      name={"draft[infos][#{index}][category]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:category)}
+                        value={option}
+                        selected={option == info["category"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">紧急度 urgency</span>
+                    <select
+                      id={"draft-urgency-#{index}"}
+                      name={"draft[infos][#{index}][urgency]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:urgency)}
+                        value={option}
+                        selected={option == info["urgency"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">严重度 severity</span>
+                    <select
+                      id={"draft-severity-#{index}"}
+                      name={"draft[infos][#{index}][severity]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:severity)}
+                        value={option}
+                        selected={option == info["severity"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">确定性 certainty</span>
+                    <select
+                      id={"draft-certainty-#{index}"}
+                      name={"draft[infos][#{index}][certainty]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:certainty)}
+                        value={option}
+                        selected={option == info["certainty"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+                <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">地区编码（逗号分隔）</span>
+                    <input
+                      type="text"
+                      id={"draft-geocodes-#{index}"}
+                      name={"draft[infos][#{index}][geocodes]"}
+                      value={info["geocodes"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 font-mono text-sm"
+                    />
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">地区描述</span>
+                    <input
+                      type="text"
+                      id={"draft-area-desc-#{index}"}
+                      name={"draft[infos][#{index}][area_desc]"}
+                      value={info["area_desc"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                </div>
+                <label class="block text-sm">
+                  <span class="mb-1 block text-zinc-600">预警描述 description</span>
+                  <textarea
+                    id={"draft-description-#{index}"}
+                    name={"draft[infos][#{index}][description]"}
+                    rows="2"
+                    class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                  >{info["description"]}</textarea>
+                </label>
+                <label class="block text-sm">
+                  <span class="mb-1 block text-zinc-600">处置建议 instruction</span>
+                  <textarea
+                    id={"draft-instruction-#{index}"}
+                    name={"draft[infos][#{index}][instruction]"}
+                    rows="2"
+                    class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                  >{info["instruction"]}</textarea>
+                </label>
               </div>
-              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-                <.input
-                  field={@draft_form[:geocodes]}
-                  type="text"
-                  label="地区编码（逗号分隔）"
-                  id="draft-geocodes"
-                />
-                <.input
-                  field={@draft_form[:area_desc]}
-                  type="text"
-                  label="地区描述"
-                  id="draft-area-desc"
-                />
-              </div>
-              <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
-                <.input
-                  field={@draft_form[:effective]}
-                  type="text"
-                  label="生效时间 ISO8601（可空）"
-                  id="draft-effective"
-                />
-                <.input
-                  field={@draft_form[:expires]}
-                  type="text"
-                  label="失效时间 ISO8601（可空）"
-                  id="draft-expires"
-                />
-              </div>
-              <.input
-                field={@draft_form[:description]}
-                type="textarea"
-                label="预警描述"
-                id="draft-description"
-              />
-              <.input
-                field={@draft_form[:instruction]}
-                type="textarea"
-                label="处置建议"
-                id="draft-instruction"
-              />
-              <div class="flex gap-2">
+
+              <div class="flex flex-wrap gap-2">
+                <button
+                  id="btn-add-info"
+                  type="submit"
+                  name="form_action"
+                  value="add_info"
+                  class="rounded-md border border-zinc-400 px-3 py-1.5 text-sm font-semibold text-zinc-700 transition hover:bg-zinc-100"
+                >
+                  拆分 info 段
+                </button>
                 <button
                   id="btn-save-draft"
                   type="submit"
@@ -377,6 +475,41 @@
               <h4 class="border-b bg-zinc-50 px-3 py-2 text-sm font-semibold">
                 v{@diff.a.version_number} → v{@diff.b.version_number} 差异
               </h4>
+
+              <div :if={@diff.areas != []} id="area-diff" class="border-b px-3 py-2">
+                <h5 class="mb-2 text-xs font-semibold text-zinc-500">按地区对比</h5>
+                <table class="w-full text-sm">
+                  <tbody>
+                    <tr
+                      :for={area <- @diff.areas}
+                      id={"area-diff-#{area.geocode}"}
+                      class="border-b last:border-0"
+                    >
+                      <td class="w-32 py-1.5 font-mono text-xs">{area.geocode}</td>
+                      <td class="py-1.5">
+                        <span class={[
+                          "mr-2 rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                          area_status_class(area.status)
+                        ]}>
+                          {area_status_label(area.status)}
+                        </span>
+                        <span :if={area.status == :unchanged} class="text-xs text-zinc-500">
+                          严重度等字段与基线一致
+                        </span>
+                        <span :for={{field, old, new} <- area.changes} class="mr-3 text-xs">
+                          <span class="font-mono text-zinc-500">{field}</span>
+                          <span class="mx-1 rounded bg-rose-50 px-1 text-rose-800 line-through">{old ||
+                            "（空）"}</span>
+                          →
+                          <span class="ml-1 rounded bg-emerald-50 px-1 text-emerald-800">{new ||
+                            "（空）"}</span>
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
               <table class="w-full text-sm">
                 <tbody>
                   <tr :if={map_size(@diff.rows) == 0}>

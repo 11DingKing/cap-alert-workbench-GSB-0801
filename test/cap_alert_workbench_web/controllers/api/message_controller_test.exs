@@ -12,21 +12,25 @@ defmodule CapAlertWorkbenchWeb.Api.MessageControllerTest do
       status: :actual,
       msg_type: :alert,
       scope: :public,
-      language: "zh-CN",
-      category: :met,
-      event: "暴雨及强对流天气",
-      urgency: :immediate,
-      severity: :severe,
-      certainty: :likely,
-      headline: "暴雨红色预警",
-      description: "描述",
-      instruction: "处置建议",
-      areas: [
-        %{
-          area_desc: "湛江市、茂名市",
-          geocodes: [
-            %{value_name: "region", value: "440800"},
-            %{value_name: "region", value: "440900"}
+      infos: [
+        %CapAlertWorkbench.Cap.Info{
+          language: "zh-CN",
+          category: :met,
+          event: "暴雨及强对流天气",
+          urgency: :immediate,
+          severity: :severe,
+          certainty: :likely,
+          headline: "暴雨红色预警",
+          description: "描述",
+          instruction: "处置建议",
+          areas: [
+            %{
+              area_desc: "湛江市、茂名市",
+              geocodes: [
+                %{value_name: "region", value: "440800"},
+                %{value_name: "region", value: "440900"}
+              ]
+            }
           ]
         }
       ]

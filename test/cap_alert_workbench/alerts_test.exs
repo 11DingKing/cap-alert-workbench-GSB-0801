@@ -3,7 +3,7 @@ defmodule CapAlertWorkbench.AlertsTest do
 
   alias CapAlertWorkbench.Alerts
   alias CapAlertWorkbench.Alerts.{AuditEvent, OutboxEvent, PublishedDocument, Version}
-  alias CapAlertWorkbench.Cap.Document
+  alias CapAlertWorkbench.Cap.{Document, Info}
 
   import Ecto.Query
 
@@ -11,14 +11,8 @@ defmodule CapAlertWorkbench.AlertsTest do
   # fixtures
   # -------------------------------------------------------------------
 
-  defp payload_fixture(overrides \\ %{}) do
-    doc = %Document{
-      identifier: "CN-20260729-GD-RAIN-001",
-      sender: "gd-moji@weather.gd.gov.cn",
-      sent: "2026-07-29T08:00:00+08:00",
-      status: :actual,
-      msg_type: :alert,
-      scope: :public,
+  defp info_fixture(overrides \\ %{}) do
+    info = %Info{
       language: "zh-CN",
       category: :met,
       event: "暴雨及强对流天气",
@@ -39,9 +33,44 @@ defmodule CapAlertWorkbench.AlertsTest do
       ]
     }
 
-    doc
-    |> Document.to_map()
-    |> Map.merge(overrides)
+    Map.merge(info, overrides)
+  end
+
+  defp payload_fixture(infos \\ nil) do
+    doc = %Document{
+      identifier: "CN-20260729-GD-RAIN-001",
+      sender: "gd-moji@weather.gd.gov.cn",
+      sent: "2026-07-29T08:00:00+08:00",
+      status: :actual,
+      msg_type: :alert,
+      scope: :public,
+      infos: infos || [info_fixture()]
+    }
+
+    Document.to_map(doc)
+  end
+
+  # 多 info 段：440800 维持 Severe（其余字段与基线一致），440900 升级 Extreme。
+  # 基于既有版本 payload 合并，保留 identifier/references。
+  defp split_infos_payload(base_payload) do
+    info_440800 =
+      info_fixture(%{
+        areas: [
+          %{area_desc: "湛江市", geocodes: [%{value_name: "region", value: "440800"}]}
+        ]
+      })
+
+    info_440900 =
+      info_fixture(%{
+        severity: :extreme,
+        headline: "茂名升级为暴雨红色预警（极端）",
+        description: "茂名市雨势进一步增强",
+        areas: [
+          %{area_desc: "茂名市", geocodes: [%{value_name: "region", value: "440900"}]}
+        ]
+      })
+
+    Map.put(base_payload, "infos", [Info.to_map(info_440800), Info.to_map(info_440900)])
   end
 
   defp stream_fixture(identifier \\ "CN-20260729-GD-RAIN-001") do
@@ -63,6 +92,14 @@ defmodule CapAlertWorkbench.AlertsTest do
     {:ok, v} = Alerts.submit_for_review(version.id, version.lock_version, "editor")
     {:ok, v} = Alerts.decide_review(v.id, :approved, "同意", "reviewer", v.lock_version)
     v
+  end
+
+  # 发布首轮，并发起更正草稿
+  defp correction_fixture do
+    version = approved_version_fixture()
+    {:ok, published} = Alerts.publish(version.id, "editor")
+    {:ok, correction} = Alerts.start_correction(version.stream_id, "editor")
+    %{version: version, published: published, correction: correction}
   end
 
   # -------------------------------------------------------------------
@@ -91,7 +128,8 @@ defmodule CapAlertWorkbench.AlertsTest do
 
   test "初始 payload 的地区编码保持 440800/440900" do
     %{version: version} = stream_fixture()
-    [area] = version.payload["areas"]
+    [info] = version.payload["infos"]
+    [area] = info["areas"]
     assert Enum.map(area["geocodes"], & &1["value"]) == ["440800", "440900"]
   end
 
@@ -103,40 +141,50 @@ defmodule CapAlertWorkbench.AlertsTest do
     %{version: version} = stream_fixture()
     assert version.lock_version == 1
 
-    payload_a = payload_fixture(%{"headline" => "浏览器 A 的标题"})
-    payload_b = payload_fixture(%{"headline" => "浏览器 B 的标题"})
+    info_a = info_fixture(%{headline: "浏览器 A 的标题"})
+    info_b = info_fixture(%{headline: "浏览器 B 的标题"})
 
     # 浏览器 A 先保存（锁号 1）
-    assert {:ok, updated} = Alerts.update_draft(version.id, %{payload: payload_a}, 1, "browser-a")
+    assert {:ok, updated} =
+             Alerts.update_draft(
+               version.id,
+               %{payload: payload_fixture([info_a])},
+               1,
+               "browser-a"
+             )
+
     assert updated.lock_version == 2
-    assert updated.payload["headline"] == "浏览器 A 的标题"
+    assert hd(updated.payload["infos"])["headline"] == "浏览器 A 的标题"
 
     # 浏览器 B 拿着旧锁号 1 保存 → 冲突
     assert {:error, :stale_lock} =
-             Alerts.update_draft(version.id, %{payload: payload_b}, 1, "browser-b")
+             Alerts.update_draft(
+               version.id,
+               %{payload: payload_fixture([info_b])},
+               1,
+               "browser-b"
+             )
 
     fresh = Repo.get!(Version, version.id)
-    assert fresh.payload["headline"] == "浏览器 A 的标题"
+    assert hd(fresh.payload["infos"])["headline"] == "浏览器 A 的标题"
     assert fresh.lock_version == 2
   end
 
   test "内容未变的保存同样触发乐观锁检查" do
     %{version: version} = stream_fixture()
 
-    # 第一次保存（内容变化）
     assert {:ok, _} =
              Alerts.update_draft(
                version.id,
-               %{payload: payload_fixture(%{"headline" => "新标题"})},
+               %{payload: payload_fixture([info_fixture(%{headline: "新标题"})])},
                1,
                "a"
              )
 
-    # 第二次保存携带旧锁号，即使内容与库中一致也必须判定为 stale
     assert {:error, :stale_lock} =
              Alerts.update_draft(
                version.id,
-               %{payload: payload_fixture(%{"headline" => "新标题"})},
+               %{payload: payload_fixture([info_fixture(%{headline: "新标题"})])},
                1,
                "b"
              )
@@ -161,7 +209,8 @@ defmodule CapAlertWorkbench.AlertsTest do
     assert in_review.lock_version == 1
 
     # 复核人基于锁号 1 打开页面；同时编辑者在复核中继续改稿
-    payload = payload_fixture(%{"headline" => "复核期间的新标题"})
+    payload = payload_fixture([info_fixture(%{headline: "复核期间的新标题"})])
+
     assert {:ok, revised} = Alerts.update_draft(in_review.id, %{payload: payload}, 1, "editor")
     assert revised.workflow == :in_review
     assert revised.lock_version == 2
@@ -210,7 +259,6 @@ defmodule CapAlertWorkbench.AlertsTest do
 
     fresh = Repo.get!(Version, version.id)
     assert fresh.workflow == :published
-    # 版本 payload 已冻结为发布时的 sent，与 XML 一致
     assert fresh.payload["sent"] =~ ~r/\+08:00$/
 
     assert Repo.get_by!(Alerts.Stream, id: version.stream_id).state == :published
@@ -288,45 +336,127 @@ defmodule CapAlertWorkbench.AlertsTest do
   end
 
   test "只能发布最新草稿版本" do
-    version = approved_version_fixture()
-    {:ok, _published} = Alerts.publish(version.id, "editor")
-
-    # 发起更正后 v1 不再是可发布对象（状态已 published，且不是最新草稿）
-    {:ok, correction} = Alerts.start_correction(version.stream_id, "editor")
+    %{version: version, correction: correction} = correction_fixture()
     assert correction.version_number == 2
 
     assert {:error, :not_latest_version} = Alerts.publish(version.id, "editor")
   end
 
   # -------------------------------------------------------------------
-  # 更正与解除
+  # 更正：C1 派生、references、多 info 并发编审发布
   # -------------------------------------------------------------------
 
-  test "更正基于最新发布版本创建，references 指向已发布文档" do
-    version = approved_version_fixture()
-    {:ok, _published} = Alerts.publish(version.id, "editor")
-    {:ok, correction} = Alerts.start_correction(version.stream_id, "editor")
+  test "更正标识派生为 -C1，references 精确指向首轮发布文档" do
+    %{published: published, correction: correction} = correction_fixture()
 
     assert correction.msg_type == :update
     assert correction.workflow == :editing
-    assert correction.version_number == 2
 
     {:ok, doc} = Document.from_map(correction.payload)
-    assert doc.identifier == "CN-20260729-GD-RAIN-001"
+    assert doc.identifier == "CN-20260729-GD-RAIN-001-C1"
     assert doc.msg_type == :update
 
-    assert [%{identifier: "CN-20260729-GD-RAIN-001", sent: sent}] = doc.references
-    assert sent =~ ~r/\+08:00$/
+    assert [%{identifier: "CN-20260729-GD-RAIN-001", sent: ref_sent}] = doc.references
+    {:ok, published_doc} = CapAlertWorkbench.Cap.Xml.parse(published.cap_xml)
+    assert ref_sent == published_doc.sent
+  end
 
-    # 更正版本走完整编审流程后发布
-    {:ok, v} = Alerts.submit_for_review(correction.id, correction.lock_version, "editor")
+  test "更正草稿可编辑为多 info 段（440800 Severe / 440900 Extreme）后发布" do
+    %{correction: correction} = correction_fixture()
+
+    payload = split_infos_payload(correction.payload)
+
+    {:ok, updated} =
+      Alerts.update_draft(correction.id, %{payload: payload}, correction.lock_version, "editor")
+
+    assert length(updated.payload["infos"]) == 2
+
+    {:ok, v} = Alerts.submit_for_review(updated.id, updated.lock_version, "editor")
     {:ok, v} = Alerts.decide_review(v.id, :approved, nil, "reviewer", v.lock_version)
-    {:ok, published2} = Alerts.publish(v.id, "editor")
-    assert published2.msg_type == :update
-    assert published2.cap_xml =~ "<msgType>Update</msgType>"
-    assert published2.cap_xml =~ "<references>"
+    {:ok, published_c1} = Alerts.publish(v.id, "editor")
+
+    assert published_c1.identifier == "CN-20260729-GD-RAIN-001-C1"
+    assert published_c1.msg_type == :update
+    assert published_c1.cap_xml =~ "<msgType>Update</msgType>"
+
+    assert published_c1.cap_xml =~
+             "<references>gd-moji@weather.gd.gov.cn,CN-20260729-GD-RAIN-001,"
+
+    assert length(Regex.scan(~r/<info>/, published_c1.cap_xml)) == 2
+    assert published_c1.cap_xml =~ "Extreme"
 
     assert Repo.get_by!(OutboxEvent, version_id: v.id).type == :alert_corrected
+  end
+
+  test "并发复核与发布：旧结论失效、不会产生第二份 C1 文档或 outbox" do
+    %{correction: correction} = correction_fixture()
+
+    payload = split_infos_payload(correction.payload)
+
+    # 两个浏览器同时编辑：第一个成功，第二个（旧锁号）失败
+    {:ok, edited} =
+      Alerts.update_draft(correction.id, %{payload: payload}, correction.lock_version, "editor-a")
+
+    assert {:error, :stale_lock} =
+             Alerts.update_draft(
+               correction.id,
+               %{payload: payload},
+               correction.lock_version,
+               "editor-b"
+             )
+
+    {:ok, in_review} = Alerts.submit_for_review(edited.id, edited.lock_version, "editor-a")
+
+    # 复核期间编辑者再改稿 → 复核结论（旧锁号）失效
+    revised_payload = split_infos_payload(edited.payload)
+
+    {:ok, revised} =
+      Alerts.update_draft(
+        in_review.id,
+        %{payload: revised_payload},
+        in_review.lock_version,
+        "editor-a"
+      )
+
+    assert {:error, :stale_review} =
+             Alerts.decide_review(
+               in_review.id,
+               :approved,
+               "旧结论",
+               "reviewer-1",
+               in_review.lock_version
+             )
+
+    {:ok, approved} =
+      Alerts.decide_review(in_review.id, :approved, "重新复核", "reviewer-1", revised.lock_version)
+
+    # 并发发布：只有一个成功
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+
+    try do
+      results =
+        [1, 2]
+        |> Enum.map(fn _ -> Task.async(fn -> Alerts.publish(approved.id, "racer") end) end)
+        |> Enum.map(&Task.await/1)
+
+      assert Enum.count(results, &match?({:ok, _}, &1)) == 1
+      assert Enum.count(results, &match?({:error, _}, &1)) == 1
+
+      # C1 文档与 outbox 全局唯一（在共享事务内断言，避免模式切换后失联）
+      assert Repo.aggregate(
+               from(p in PublishedDocument,
+                 where: p.identifier == "CN-20260729-GD-RAIN-001-C1"
+               ),
+               :count
+             ) == 1
+
+      assert Repo.aggregate(
+               from(o in OutboxEvent, where: o.type == :alert_corrected),
+               :count
+             ) == 1
+    after
+      Ecto.Adapters.SQL.Sandbox.mode(Repo, :manual)
+    end
   end
 
   test "解除发布后消息流进入 cancelled，此后不能再更正" do
@@ -335,6 +465,9 @@ defmodule CapAlertWorkbench.AlertsTest do
 
     {:ok, cancellation} = Alerts.start_cancellation(version.stream_id, "editor")
     assert cancellation.msg_type == :cancel
+
+    {:ok, cancel_doc} = Document.from_map(cancellation.payload)
+    assert cancel_doc.identifier == "CN-20260729-GD-RAIN-001-X1"
 
     {:ok, v} = Alerts.submit_for_review(cancellation.id, cancellation.lock_version, "editor")
     {:ok, v} = Alerts.decide_review(v.id, :approved, nil, "reviewer", v.lock_version)
@@ -351,10 +484,7 @@ defmodule CapAlertWorkbench.AlertsTest do
   end
 
   test "存在活动草稿时不能重复发起更正/解除" do
-    version = approved_version_fixture()
-    {:ok, _published} = Alerts.publish(version.id, "editor")
-
-    {:ok, _correction} = Alerts.start_correction(version.stream_id, "editor")
+    %{version: version} = correction_fixture()
 
     assert {:error, :draft_already_exists} =
              Alerts.start_correction(version.stream_id, "editor")
@@ -371,17 +501,92 @@ defmodule CapAlertWorkbench.AlertsTest do
   end
 
   # -------------------------------------------------------------------
+  # 多 info 编辑合成
+  # -------------------------------------------------------------------
+
+  test "compose_payload 多 info 形态：按段独立设置严重度" do
+    %{correction: correction} = correction_fixture()
+
+    params = %{
+      "status" => "Actual",
+      "infos" => %{
+        "0" => %{
+          "event" => "暴雨及强对流天气",
+          "headline" => "湛江维持",
+          "language" => "zh-CN",
+          "category" => "Met",
+          "urgency" => "Immediate",
+          "severity" => "Severe",
+          "certainty" => "Likely",
+          "geocodes" => "440800",
+          "area_desc" => "湛江市",
+          "description" => "描述1",
+          "instruction" => "建议1"
+        },
+        "1" => %{
+          "event" => "暴雨及强对流天气",
+          "headline" => "茂名升级",
+          "language" => "zh-CN",
+          "category" => "Met",
+          "urgency" => "Immediate",
+          "severity" => "Extreme",
+          "certainty" => "Likely",
+          "geocodes" => "440900",
+          "area_desc" => "茂名市",
+          "description" => "描述2",
+          "instruction" => "建议2"
+        }
+      }
+    }
+
+    assert {:ok, payload} = Alerts.compose_payload(correction, params)
+    [info1, info2] = payload["infos"]
+    assert info1["severity"] == "Severe"
+    assert info2["severity"] == "Extreme"
+    # identifier / references 保持稳定
+    assert payload["identifier"] == "CN-20260729-GD-RAIN-001-C1"
+    assert payload["references"] != []
+  end
+
+  test "compose_payload 扁平形态：仅作用于首个 info 段" do
+    %{correction: correction} = correction_fixture()
+
+    assert {:ok, payload} =
+             Alerts.compose_payload(correction, %{"headline" => "扁平标题", "severity" => "Extreme"})
+
+    [info1] = payload["infos"]
+    assert info1["headline"] == "扁平标题"
+    assert info1["severity"] == "Extreme"
+  end
+
+  # -------------------------------------------------------------------
   # XML 导入导出与差异
   # -------------------------------------------------------------------
 
-  test "导出的 CAP XML round-trip 与版本 payload 一致" do
-    %{version: version} = stream_fixture()
-    {:ok, xml} = Alerts.export_cap_xml(version.id)
+  test "导出的多 info CAP XML 导入后地区-严重度对应关系完整 round-trip" do
+    %{correction: correction} = correction_fixture()
 
-    assert xml =~ ~s(<?xml version="1.0")
+    {:ok, updated} =
+      Alerts.update_draft(
+        correction.id,
+        %{payload: split_infos_payload(correction.payload)},
+        correction.lock_version,
+        "editor"
+      )
+
+    {:ok, xml} = Alerts.export_cap_xml(updated.id)
     assert {:ok, doc} = CapAlertWorkbench.Cap.Xml.parse(xml)
-    assert doc.identifier == "CN-20260729-GD-RAIN-001"
-    assert doc.areas |> hd() |> Map.get(:geocodes) |> Enum.map(& &1.value) == ["440800", "440900"]
+    assert doc.identifier == "CN-20260729-GD-RAIN-001-C1"
+
+    [i1, i2] = doc.infos
+    assert Info.geocodes(i1) == ["440800"]
+    assert i1.severity == :severe
+    assert Info.geocodes(i2) == ["440900"]
+    assert i2.severity == :extreme
+
+    # 再序列化再解析，结构不变
+    assert {:ok, doc2} = CapAlertWorkbench.Cap.Xml.parse(CapAlertWorkbench.Cap.Xml.serialize(doc))
+    assert doc2 == doc
   end
 
   test "导入 CAP XML 创建新消息流并写入导入审计" do
@@ -416,15 +621,43 @@ defmodule CapAlertWorkbench.AlertsTest do
     assert {:error, :identifier_taken} = Alerts.import_cap_xml(xml, "importer")
   end
 
-  test "版本差异按字段返回" do
+  test "版本差异按字段返回（多 info 路径）" do
     %{version: version} = stream_fixture()
-    payload = payload_fixture(%{"headline" => "新标题", "severity" => "Extreme"})
-    {:ok, updated} = Alerts.update_draft(version.id, %{payload: payload}, 1, "editor")
+
+    {:ok, updated} =
+      Alerts.update_draft(
+        version.id,
+        %{payload: payload_fixture([info_fixture(%{headline: "新标题", severity: :extreme})])},
+        1,
+        "editor"
+      )
 
     diff = Alerts.diff_versions(version, updated)
 
-    assert diff["headline"] == {"暴雨红色预警", "新标题"}
-    assert diff["severity"] == {"Severe", "Extreme"}
-    refute Map.has_key?(diff, "event")
+    assert diff["info1.headline"] == {"暴雨红色预警", "新标题"}
+    assert diff["info1.severity"] == {"Severe", "Extreme"}
+    refute Map.has_key?(diff, "info1.event")
+  end
+
+  test "按地区差异：440800 未变化，440900 Severe→Extreme" do
+    %{version: version, correction: correction} = correction_fixture()
+
+    {:ok, edited} =
+      Alerts.update_draft(
+        correction.id,
+        %{payload: split_infos_payload(correction.payload)},
+        correction.lock_version,
+        "editor"
+      )
+
+    areas = Alerts.diff_areas(version, edited)
+
+    by_geocode = Map.new(areas, &{&1.geocode, &1})
+
+    assert by_geocode["440800"].status == :unchanged
+    assert by_geocode["440900"].status == :changed
+
+    assert {"severity", "Severe", "Extreme"} in by_geocode["440900"].changes
+    assert {"headline", "暴雨红色预警", "茂名升级为暴雨红色预警（极端）"} in by_geocode["440900"].changes
   end
 end

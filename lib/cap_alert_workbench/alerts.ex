@@ -26,7 +26,7 @@ defmodule CapAlertWorkbench.Alerts do
     Version
   }
 
-  alias CapAlertWorkbench.Cap.{Document, Lifecycle, Xml}
+  alias CapAlertWorkbench.Cap.{Document, Enums, Lifecycle, Xml}
   alias CapAlertWorkbench.Repo
 
   @pubsub CapAlertWorkbench.PubSub
@@ -455,9 +455,25 @@ defmodule CapAlertWorkbench.Alerts do
       source_version = Repo.get!(Version, latest_published.version_id)
       {:ok, source_doc} = Document.from_map(source_version.payload)
 
+      # 更正/解除标识从消息流稳定标识派生：-C1/-C2…（更正）、-X1…（解除）
+      followup_number =
+        Repo.one!(
+          from(p in PublishedDocument,
+            where: p.stream_id == ^stream_id and p.msg_type == ^msg_type,
+            select: count(p.id)
+          )
+        ) + 1
+
+      suffix =
+        case msg_type do
+          :update -> "-C#{followup_number}"
+          :cancel -> "-X#{followup_number}"
+        end
+
       followup_doc = %{
         source_doc
-        | msg_type: msg_type,
+        | identifier: stream.identifier <> suffix,
+          msg_type: msg_type,
           references: [
             %{
               sender: source_doc.sender,
@@ -500,8 +516,15 @@ defmodule CapAlertWorkbench.Alerts do
   @doc """
   把编辑表单/API 字段参数合成新的版本 payload。
 
+  两种形态：
+
+    * 多 info 段：`%{"infos" => %{"0" => %{...}, "1" => %{...}}}`，
+      每个 info 段独立携带 severity/headline/description/area 等；
+    * 扁平单 info：`%{"headline" => ..., "severity" => ...}`，
+      仅作用于首个 info 段（兼容旧 API 调用）。
+
   保留原文档的稳定字段（identifier、sender、references、未知扩展字段），
-  只覆盖可编辑字段。枚举经 `Enums.from_cap/2` 严格映射。
+  枚举经 `Enums.from_cap/2` 严格映射。
   """
   def compose_payload(%Version{} = version, params) when is_map(params) do
     with {:ok, doc} <- Document.from_map(version.payload),
@@ -511,43 +534,78 @@ defmodule CapAlertWorkbench.Alerts do
     end
   end
 
-  defp apply_edit_params(doc, params) do
+  defp apply_edit_params(doc, %{"infos" => infos_params} = params)
+       when is_map(infos_params) do
     with {:ok, status} <- enum_param(params, "status", :status, doc.status),
-         {:ok, category} <- enum_param(params, "category", :category, doc.category),
-         {:ok, urgency} <- enum_param(params, "urgency", :urgency, doc.urgency),
-         {:ok, severity} <- enum_param(params, "severity", :severity, doc.severity),
-         {:ok, certainty} <- enum_param(params, "certainty", :certainty, doc.certainty) do
+         {:ok, infos} <- build_infos(doc.infos, infos_params) do
+      {:ok, %{doc | status: status, infos: infos}}
+    end
+  end
+
+  defp apply_edit_params(doc, params) do
+    # 扁平形态：仅编辑首个 info 段，其余 info 段保持不变
+    with {:ok, status} <- enum_param(params, "status", :status, doc.status),
+         {:ok, first} <- apply_info_params(first_info(doc), params) do
+      infos = [first | Enum.drop(doc.infos, 1)]
+      {:ok, %{doc | status: status, infos: infos}}
+    end
+  end
+
+  defp first_info(%Document{infos: [first | _]}), do: first
+  defp first_info(%Document{infos: []}), do: %CapAlertWorkbench.Cap.Info{}
+
+  defp build_infos(existing, infos_params) do
+    infos_params
+    |> Enum.sort_by(fn {index, _fields} -> String.to_integer(index) end)
+    |> Enum.reduce_while({:ok, []}, fn {index, fields}, {:ok, acc} ->
+      base = Enum.at(existing, String.to_integer(index)) || %CapAlertWorkbench.Cap.Info{}
+
+      case apply_info_params(base, stringify_keys(fields)) do
+        {:ok, info} -> {:cont, {:ok, [info | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, infos} -> {:ok, Enum.reverse(infos)}
+      error -> error
+    end
+  end
+
+  defp apply_info_params(info, params) do
+    with {:ok, category} <- enum_param(params, "category", :category, info.category),
+         {:ok, urgency} <- enum_param(params, "urgency", :urgency, info.urgency),
+         {:ok, severity} <- enum_param(params, "severity", :severity, info.severity),
+         {:ok, certainty} <- enum_param(params, "certainty", :certainty, info.certainty) do
       geocodes = parse_geocodes(Map.get(params, "geocodes"))
 
       areas =
         case {Map.get(params, "area_desc"), geocodes} do
           {nil, nil} ->
-            doc.areas
+            info.areas
 
           {area_desc, codes} ->
             [
               %{
-                area_desc: area_desc || current_area_desc(doc),
-                geocodes: Enum.map(codes || current_geocodes(doc), & &1)
+                area_desc: area_desc || current_area_desc(info),
+                geocodes: codes || current_geocodes(info)
               }
             ]
         end
 
       {:ok,
        %{
-         doc
-         | status: status,
-           category: category,
+         info
+         | category: category,
            urgency: urgency,
            severity: severity,
            certainty: certainty,
-           language: blank_to(Map.get(params, "language"), doc.language),
-           event: blank_to(Map.get(params, "event"), doc.event),
-           headline: blank_to(Map.get(params, "headline"), doc.headline),
-           description: blank_to(Map.get(params, "description"), doc.description),
-           instruction: blank_to(Map.get(params, "instruction"), doc.instruction),
-           effective: blank_to(Map.get(params, "effective"), doc.effective),
-           expires: blank_to(Map.get(params, "expires"), doc.expires),
+           language: blank_to(Map.get(params, "language"), info.language),
+           event: blank_to(Map.get(params, "event"), info.event),
+           headline: blank_to(Map.get(params, "headline"), info.headline),
+           description: blank_to(Map.get(params, "description"), info.description),
+           instruction: blank_to(Map.get(params, "instruction"), info.instruction),
+           effective: blank_to(Map.get(params, "effective"), info.effective),
+           expires: blank_to(Map.get(params, "expires"), info.expires),
            areas: areas
        }}
     end
@@ -582,15 +640,15 @@ defmodule CapAlertWorkbench.Alerts do
     end)
   end
 
-  defp current_area_desc(doc) do
-    case doc.areas do
+  defp current_area_desc(info) do
+    case info.areas do
       [area | _] -> area.area_desc
       [] -> nil
     end
   end
 
-  defp current_geocodes(doc) do
-    case doc.areas do
+  defp current_geocodes(info) do
+    case info.areas do
       [area | _] -> area.geocodes
       [] -> []
     end
@@ -606,7 +664,8 @@ defmodule CapAlertWorkbench.Alerts do
 
   @doc """
   两个版本的字段级差异。返回 `%{path => {old_value, new_value | nil}}`，
-  值均为展示用字符串。键路径稳定，便于 UI 渲染。
+  值均为展示用字符串。路径示例：`severity`（alert 级不含）、
+  `info1.severity`、`info2.geocodes`。
   """
   def diff_versions(%Version{} = a, %Version{} = b) do
     flat_a = flatten_payload(a.payload)
@@ -621,30 +680,113 @@ defmodule CapAlertWorkbench.Alerts do
     |> Map.new()
   end
 
+  @area_tracked_fields ~w(severity urgency certainty headline description event)
+
+  @doc """
+  按地区（geocode）对比两个版本。
+
+  返回 `[%{geocode, status, changes}]`：status 为
+  `:unchanged | :changed | :added | :removed`；changes 为
+  `[{field, old, new}]`，例如 `{"severity", "Severe", "Extreme"}`。
+  用于差异页展示「440800 未变化、440900 Severe→Extreme」。
+  """
+  def diff_areas(%Version{} = a, %Version{} = b) do
+    with {:ok, doc_a} <- Document.from_map(a.payload),
+         {:ok, doc_b} <- Document.from_map(b.payload) do
+      index_a = area_index(doc_a)
+      index_b = area_index(doc_b)
+
+      (Map.keys(index_a) ++ Map.keys(index_b))
+      |> Enum.uniq()
+      |> Enum.sort()
+      |> Enum.map(fn geocode ->
+        case {Map.get(index_a, geocode), Map.get(index_b, geocode)} do
+          {nil, new} ->
+            %{geocode: geocode, status: :added, changes: field_changes(%{}, new)}
+
+          {old, nil} ->
+            %{geocode: geocode, status: :removed, changes: field_changes(old, %{})}
+
+          {old, new} ->
+            case field_changes(old, new) do
+              [] -> %{geocode: geocode, status: :unchanged, changes: []}
+              changes -> %{geocode: geocode, status: :changed, changes: changes}
+            end
+        end
+      end)
+    end
+  end
+
+  defp area_index(%Document{} = doc) do
+    for info <- doc.infos, geocode <- CapAlertWorkbench.Cap.Info.geocodes(info), reduce: %{} do
+      acc ->
+        Map.put(acc, geocode, %{
+          "severity" => Enums.to_cap(:severity, info.severity),
+          "urgency" => Enums.to_cap(:urgency, info.urgency),
+          "certainty" => Enums.to_cap(:certainty, info.certainty),
+          "headline" => info.headline,
+          "description" => info.description,
+          "event" => info.event
+        })
+    end
+  end
+
+  defp field_changes(old, new) do
+    Enum.flat_map(@area_tracked_fields, fn field ->
+      old_value = Map.get(old, field)
+      new_value = Map.get(new, field)
+
+      if old_value == new_value do
+        []
+      else
+        [{field, old_value, new_value}]
+      end
+    end)
+  end
+
   defp flatten_payload(payload) do
-    scalar_keys = ~w(identifier sender sent status msgType scope language category event
-                     urgency severity certainty headline description instruction
-                     effective expires)
-
-    scalars = Map.take(payload, scalar_keys)
-
-    geocodes =
-      (payload["areas"] || [])
-      |> Enum.flat_map(fn area -> area["geocodes"] || [] end)
-      |> Enum.map_join(", ", fn gc -> "#{gc["value_name"]}=#{gc["value"]}" end)
+    alert_scalars = Map.take(payload, ~w(identifier sender sent status msg_type scope))
 
     references =
       (payload["references"] || [])
       |> Enum.map_join("; ", fn ref -> "#{ref["sender"]},#{ref["identifier"]},#{ref["sent"]}" end)
 
-    scalars
-    |> Map.put("geocodes", geocodes)
+    infos_flat =
+      (payload["infos"] || [])
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {info, index} ->
+        geocodes =
+          (info["areas"] || [])
+          |> Enum.flat_map(fn area -> area["geocodes"] || [] end)
+          |> Enum.map_join(", ", fn gc -> "#{gc["value_name"]}=#{gc["value"]}" end)
+
+        area_desc =
+          case info["areas"] do
+            [area | _] -> area["area_desc"]
+            _ -> nil
+          end
+
+        prefix = "info#{index}"
+
+        %{
+          "#{prefix}.event" => info["event"],
+          "#{prefix}.severity" => info["severity"],
+          "#{prefix}.urgency" => info["urgency"],
+          "#{prefix}.certainty" => info["certainty"],
+          "#{prefix}.headline" => info["headline"],
+          "#{prefix}.description" => info["description"],
+          "#{prefix}.instruction" => info["instruction"],
+          "#{prefix}.area_desc" => area_desc,
+          "#{prefix}.geocodes" => geocodes,
+          "#{prefix}.extensions" => "#{length(info["extensions"] || [])} 个扩展元素"
+        }
+      end)
+      |> Map.new()
+
+    alert_scalars
     |> Map.put("references", references)
-    |> Map.put(
-      "alert_extensions",
-      "#{length(payload["alert_extensions"] || [])} 个扩展元素"
-    )
-    |> Map.put("info_extensions", "#{length(payload["info_extensions"] || [])} 个扩展元素")
+    |> Map.put("extensions", "#{length(payload["extensions"] || [])} 个扩展元素")
+    |> Map.merge(infos_flat)
     |> Map.new(fn {k, v} -> {k, to_string(v || "")} end)
   end
 
@@ -718,7 +860,7 @@ defmodule CapAlertWorkbench.Alerts do
   defp topic(stream_id), do: "alert_stream:#{stream_id}"
 
   defp payload_msg_type(payload) do
-    case payload["msgType"] || payload[:msgType] do
+    case payload["msg_type"] do
       "Alert" -> :alert
       "Update" -> :update
       "Cancel" -> :cancel
@@ -734,4 +876,8 @@ defmodule CapAlertWorkbench.Alerts do
   end
 
   defp now, do: DateTime.utc_now()
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), v} end)
+  end
 end

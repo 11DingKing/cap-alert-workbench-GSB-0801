@@ -2,15 +2,19 @@ defmodule CapAlertWorkbench.Cap.Document do
   @moduledoc """
   CAP 预警文档的结构化表示（领域层，纯数据结构）。
 
-  字段使用受限 atom 枚举（见 `CapAlertWorkbench.Cap.Enums`）。
-  未识别的扩展元素以 `Element` 树原样保留在 `alert_extensions` /
-  `info_extensions` 中，序列化时按原样输出，保证导入导出 round-trip。
+  一条文档由 alert 级字段（identifier/sender/sent/status/msgType/scope/references）
+  与一至多个 `Info` 段组成。多 info 段用于表达分地区预警（如 440800 维持
+  Severe、440900 升级 Extreme）。
 
-  `sent`、`effective`、`expires` 保存 ISO 8601 原文（导入时校验合法性，
-  不做时区归一化），以保证 round-trip 字节级稳定。
+  未识别的扩展元素以 `Element` 树原样保留在 alert 级 `extensions` 与各 info
+  段的 `extensions` 中，序列化时按原样输出，保证导入导出 round-trip。
+
+  `sent` 保存 ISO 8601 原文（导入时校验合法性，不做时区归一化），保证
+  round-trip 字节级稳定。
   """
 
   alias CapAlertWorkbench.Cap.Enums
+  alias CapAlertWorkbench.Cap.Info
   alias CapAlertWorkbench.Cap.Xml.Element
 
   @cap_namespace "urn:oasis:names:tc:emergency:cap:1.2"
@@ -22,24 +26,10 @@ defmodule CapAlertWorkbench.Cap.Document do
             msg_type: :alert,
             scope: :public,
             references: [],
-            language: "zh-CN",
-            category: :met,
-            event: nil,
-            urgency: :immediate,
-            severity: :severe,
-            certainty: :likely,
-            headline: nil,
-            description: nil,
-            instruction: nil,
-            effective: nil,
-            expires: nil,
-            areas: [],
-            alert_extensions: [],
-            info_extensions: []
+            infos: [],
+            extensions: []
 
   @type cap_reference :: %{sender: String.t(), identifier: String.t(), sent: String.t()}
-  @type geocode :: %{value_name: String.t(), value: String.t()}
-  @type area :: %{area_desc: String.t() | nil, geocodes: [geocode()]}
 
   @type t :: %__MODULE__{
           identifier: String.t() | nil,
@@ -49,20 +39,8 @@ defmodule CapAlertWorkbench.Cap.Document do
           msg_type: atom(),
           scope: atom(),
           references: [cap_reference()],
-          language: String.t(),
-          category: atom(),
-          event: String.t() | nil,
-          urgency: atom(),
-          severity: atom(),
-          certainty: atom(),
-          headline: String.t() | nil,
-          description: String.t() | nil,
-          instruction: String.t() | nil,
-          effective: String.t() | nil,
-          expires: String.t() | nil,
-          areas: [area()],
-          alert_extensions: [Element.t()],
-          info_extensions: [Element.t()]
+          infos: [Info.t()],
+          extensions: [Element.t()]
         }
 
   def cap_namespace, do: @cap_namespace
@@ -78,11 +56,8 @@ defmodule CapAlertWorkbench.Cap.Document do
     |> require_present(:identifier, doc.identifier)
     |> require_present(:sender, doc.sender)
     |> require_present(:sent, doc.sent)
-    |> require_present(:event, doc.event)
     |> require_datetime(:sent, doc.sent)
-    |> require_datetime(:effective, doc.effective)
-    |> require_datetime(:expires, doc.expires)
-    |> validate_areas(doc.areas)
+    |> validate_infos(doc.infos)
     |> case do
       [] -> :ok
       errors -> {:error, Enum.reverse(errors)}
@@ -106,7 +81,29 @@ defmodule CapAlertWorkbench.Cap.Document do
     end
   end
 
-  defp validate_areas(errors, areas) when is_list(areas) do
+  defp validate_infos(errors, []), do: [{:infos, "至少需要一个 info 段"} | errors]
+
+  defp validate_infos(errors, infos) do
+    infos
+    |> Enum.with_index()
+    |> Enum.reduce(errors, fn {info, index}, acc ->
+      acc
+      |> require_info_present(index, :event, info.event)
+      |> require_datetime({:info, index, :effective}, info.effective)
+      |> require_datetime({:info, index, :expires}, info.expires)
+      |> validate_geocodes(index, info.areas)
+    end)
+  end
+
+  defp require_info_present(errors, index, field, value) do
+    if is_binary(value) and String.trim(value) != "" do
+      errors
+    else
+      [{{:info, index, field}, "info 段 #{index + 1} 的 #{field} 不能为空"} | errors]
+    end
+  end
+
+  defp validate_geocodes(errors, index, areas) when is_list(areas) do
     Enum.reduce(areas, errors, fn area, acc ->
       geocodes = Map.get(area, :geocodes) || Map.get(area, "geocodes") || []
 
@@ -116,7 +113,7 @@ defmodule CapAlertWorkbench.Cap.Document do
          end) do
         acc
       else
-        [{:areas, "geocode 编码不能为空"} | acc]
+        [{{:info, index, :areas}, "info 段 #{index + 1} 的 geocode 编码不能为空"} | acc]
       end
     end)
   end
@@ -128,23 +125,6 @@ defmodule CapAlertWorkbench.Cap.Document do
   @doc "把文档转换为 `alert` 根元素树。"
   @spec to_element(t()) :: Element.t()
   def to_element(%__MODULE__{} = doc) do
-    info_children =
-      [
-        text_element("language", doc.language),
-        text_element("category", Enums.to_cap(:category, doc.category)),
-        text_element("event", doc.event),
-        text_element("urgency", Enums.to_cap(:urgency, doc.urgency)),
-        text_element("severity", Enums.to_cap(:severity, doc.severity)),
-        text_element("certainty", Enums.to_cap(:certainty, doc.certainty))
-      ]
-      |> maybe_append("effective", doc.effective)
-      |> maybe_append("expires", doc.expires)
-      |> maybe_append("headline", doc.headline)
-      |> maybe_append("description", doc.description)
-      |> maybe_append("instruction", doc.instruction)
-      |> Kernel.++(Enum.map(doc.areas, &area_element/1))
-      |> Kernel.++(doc.info_extensions)
-
     alert_children =
       [
         text_element("identifier", doc.identifier),
@@ -155,10 +135,31 @@ defmodule CapAlertWorkbench.Cap.Document do
         text_element("scope", Enums.to_cap(:scope, doc.scope))
       ]
       |> maybe_append_references(doc.references)
-      |> Kernel.++([Element.new("info", [], info_children)])
-      |> Kernel.++(doc.alert_extensions)
+      |> Kernel.++(Enum.map(doc.infos, &info_to_element/1))
+      |> Kernel.++(doc.extensions)
 
     Element.new("alert", [{"xmlns", @cap_namespace}], alert_children)
+  end
+
+  defp info_to_element(%Info{} = info) do
+    children =
+      [
+        text_element("language", info.language),
+        text_element("category", Enums.to_cap(:category, info.category)),
+        text_element("event", info.event),
+        text_element("urgency", Enums.to_cap(:urgency, info.urgency)),
+        text_element("severity", Enums.to_cap(:severity, info.severity)),
+        text_element("certainty", Enums.to_cap(:certainty, info.certainty))
+      ]
+      |> maybe_append("effective", info.effective)
+      |> maybe_append("expires", info.expires)
+      |> maybe_append("headline", info.headline)
+      |> maybe_append("description", info.description)
+      |> maybe_append("instruction", info.instruction)
+      |> Kernel.++(Enum.map(info.areas, &area_element/1))
+      |> Kernel.++(info.extensions)
+
+    Element.new("info", [], children)
   end
 
   defp text_element(_name, nil), do: nil
@@ -213,7 +214,7 @@ defmodule CapAlertWorkbench.Cap.Document do
 
   @doc """
   从元素树解析文档。根元素本地名必须是 `alert`；枚举值严格映射；
-  未识别的 alert/info 级子元素保留为扩展。
+  未识别的 alert/info 级子元素保留为扩展。支持多个 info 段。
   """
   @spec from_element(Element.t()) :: {:ok, t()} | {:error, term()}
   def from_element(%Element{} = root) do
@@ -222,22 +223,37 @@ defmodule CapAlertWorkbench.Cap.Document do
            {:ok, msg_type} <- enum_field(root, "msgType", :msg_type),
            {:ok, scope} <- enum_field(root, "scope", :scope),
            {:ok, references} <- parse_references(Element.find_child(root, "references")),
-           {:ok, info_fields} <- parse_info(Element.find_child(root, "info")) do
-        doc = %__MODULE__{
-          identifier: child_text(root, "identifier"),
-          sender: child_text(root, "sender"),
-          sent: child_text(root, "sent"),
-          status: status,
-          msg_type: msg_type,
-          scope: scope,
-          references: references,
-          alert_extensions: extensions_of(root, @alert_known)
-        }
-
-        {:ok, Map.merge(doc, info_fields)}
+           {:ok, infos} <- parse_infos(Element.find_children(root, "info")) do
+        {:ok,
+         %__MODULE__{
+           identifier: child_text(root, "identifier"),
+           sender: child_text(root, "sender"),
+           sent: child_text(root, "sent"),
+           status: status,
+           msg_type: msg_type,
+           scope: scope,
+           references: references,
+           infos: infos,
+           extensions: extensions_of(root, @alert_known)
+         }}
       end
     else
       {:error, {:unexpected_root, root.name}}
+    end
+  end
+
+  defp parse_infos([]), do: {:error, {:missing_element, "info"}}
+
+  defp parse_infos(info_elements) do
+    Enum.reduce_while(info_elements, {:ok, []}, fn el, {:ok, acc} ->
+      case parse_info(el) do
+        {:ok, info} -> {:cont, {:ok, [info | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, infos} -> {:ok, Enum.reverse(infos)}
+      error -> error
     end
   end
 
@@ -269,15 +285,13 @@ defmodule CapAlertWorkbench.Cap.Document do
     end
   end
 
-  defp parse_info(nil), do: {:error, {:missing_element, "info"}}
-
-  defp parse_info(%Element{} = info) do
-    with {:ok, urgency} <- enum_field(info, "urgency", :urgency),
-         {:ok, severity} <- enum_field(info, "severity", :severity),
-         {:ok, certainty} <- enum_field(info, "certainty", :certainty),
-         {:ok, category} <- enum_field(info, "category", :category) do
+  defp parse_info(%Element{} = info_el) do
+    with {:ok, urgency} <- enum_field(info_el, "urgency", :urgency),
+         {:ok, severity} <- enum_field(info_el, "severity", :severity),
+         {:ok, certainty} <- enum_field(info_el, "certainty", :certainty),
+         {:ok, category} <- enum_field(info_el, "category", :category) do
       areas =
-        info
+        info_el
         |> Element.find_children("area")
         |> Enum.map(fn area ->
           geocodes =
@@ -291,20 +305,20 @@ defmodule CapAlertWorkbench.Cap.Document do
         end)
 
       {:ok,
-       %{
-         language: child_text(info, "language") || "zh-CN",
+       %Info{
+         language: child_text(info_el, "language") || "zh-CN",
          category: category,
-         event: child_text(info, "event"),
+         event: child_text(info_el, "event"),
          urgency: urgency,
          severity: severity,
          certainty: certainty,
-         effective: child_text(info, "effective"),
-         expires: child_text(info, "expires"),
-         headline: child_text(info, "headline"),
-         description: child_text(info, "description"),
-         instruction: child_text(info, "instruction"),
+         effective: child_text(info_el, "effective"),
+         expires: child_text(info_el, "expires"),
+         headline: child_text(info_el, "headline"),
+         description: child_text(info_el, "description"),
+         instruction: child_text(info_el, "instruction"),
          areas: areas,
-         info_extensions: extensions_of(info, @info_known)
+         extensions: extensions_of(info_el, @info_known)
        }}
     end
   end
@@ -334,83 +348,58 @@ defmodule CapAlertWorkbench.Cap.Document do
   # jsonb 存储映射（纯 map，不含 struct）
   # ------------------------------------------------------------------
 
-  @scalar_fields [
-    :identifier,
-    :sender,
-    :sent,
-    :language,
-    :event,
-    :headline,
-    :description,
-    :instruction,
-    :effective,
-    :expires
-  ]
-
-  @enum_fields [:status, :msg_type, :scope, :category, :urgency, :severity, :certainty]
+  @alert_enum_fields [:status, :msg_type, :scope]
 
   @doc "文档 -> jsonb 可存储的纯 map。枚举显式映射为 CAP 字符串。"
   @spec to_map(t()) :: map()
   def to_map(%__MODULE__{} = doc) do
-    scalars = Map.new(@scalar_fields, fn f -> {Atom.to_string(f), Map.get(doc, f)} end)
-
     enums =
-      Map.new(@enum_fields, fn f -> {Atom.to_string(f), Enums.to_cap(f, Map.get(doc, f))} end)
+      Map.new(@alert_enum_fields, fn f ->
+        {Atom.to_string(f), Enums.to_cap(f, Map.get(doc, f))}
+      end)
 
-    scalars
+    %{
+      "identifier" => doc.identifier,
+      "sender" => doc.sender,
+      "sent" => doc.sent,
+      "references" =>
+        Enum.map(doc.references, fn ref ->
+          %{"sender" => ref.sender, "identifier" => ref.identifier, "sent" => ref.sent}
+        end),
+      "infos" => Enum.map(doc.infos, &Info.to_map/1),
+      "extensions" => Enum.map(doc.extensions, &Element.to_map/1)
+    }
     |> Map.merge(enums)
-    |> Map.put("references", Enum.map(doc.references, &stringify_keys/1))
-    |> Map.put("areas", Enum.map(doc.areas, &area_to_map/1))
-    |> Map.put("alert_extensions", Enum.map(doc.alert_extensions, &Element.to_map/1))
-    |> Map.put("info_extensions", Enum.map(doc.info_extensions, &Element.to_map/1))
   end
 
   @doc "jsonb map -> 文档。枚举严格映射，未知值返回错误。"
   @spec from_map(map()) :: {:ok, t()} | {:error, term()}
   def from_map(%{} = map) do
-    with {:ok, enums} <- parse_enum_map(map) do
-      doc =
-        struct!(
-          __MODULE__,
-          Map.merge(
-            %{
-              identifier: map["identifier"],
-              sender: map["sender"],
-              sent: map["sent"],
-              language: map["language"] || "zh-CN",
-              event: map["event"],
-              headline: map["headline"],
-              description: map["description"],
-              instruction: map["instruction"],
-              effective: map["effective"],
-              expires: map["expires"],
-              references:
-                Enum.map(map["references"] || [], fn ref ->
-                  %{sender: ref["sender"], identifier: ref["identifier"], sent: ref["sent"]}
-                end),
-              areas:
-                Enum.map(map["areas"] || [], fn area ->
-                  %{
-                    area_desc: area["area_desc"],
-                    geocodes:
-                      Enum.map(area["geocodes"] || [], fn gc ->
-                        %{value_name: gc["value_name"], value: gc["value"]}
-                      end)
-                  }
-                end),
-              alert_extensions: Enum.map(map["alert_extensions"] || [], &Element.from_map/1),
-              info_extensions: Enum.map(map["info_extensions"] || [], &Element.from_map/1)
-            },
-            enums
-          )
-        )
-
-      {:ok, doc}
+    with {:ok, enums} <- parse_alert_enums(map),
+         {:ok, infos} <- parse_info_maps(map["infos"] || []) do
+      {:ok,
+       struct!(
+         __MODULE__,
+         Map.merge(
+           %{
+             identifier: map["identifier"],
+             sender: map["sender"],
+             sent: map["sent"],
+             references:
+               Enum.map(map["references"] || [], fn ref ->
+                 %{sender: ref["sender"], identifier: ref["identifier"], sent: ref["sent"]}
+               end),
+             infos: infos,
+             extensions: Enum.map(map["extensions"] || [], &Element.from_map/1)
+           },
+           enums
+         )
+       )}
     end
   end
 
-  defp parse_enum_map(map) do
-    Enum.reduce_while(@enum_fields, {:ok, %{}}, fn field, {:ok, acc} ->
+  defp parse_alert_enums(map) do
+    Enum.reduce_while(@alert_enum_fields, {:ok, %{}}, fn field, {:ok, acc} ->
       case Enums.from_cap(field, Map.fetch!(map, Atom.to_string(field))) do
         {:ok, value} -> {:cont, {:ok, Map.put(acc, field, value)}}
         {:error, _} = error -> {:halt, error}
@@ -418,20 +407,16 @@ defmodule CapAlertWorkbench.Cap.Document do
     end)
   end
 
-  defp stringify_keys(map) do
-    Map.new(map, fn {k, v} -> {to_string(k), v} end)
-  end
-
-  defp area_to_map(area) do
-    %{
-      "area_desc" => Map.get(area, :area_desc) || Map.get(area, "area_desc"),
-      "geocodes" =>
-        Enum.map(Map.get(area, :geocodes) || Map.get(area, "geocodes") || [], fn gc ->
-          %{
-            "value_name" => Map.get(gc, :value_name) || Map.get(gc, "value_name"),
-            "value" => Map.get(gc, :value) || Map.get(gc, "value")
-          }
-        end)
-    }
+  defp parse_info_maps(info_maps) do
+    Enum.reduce_while(info_maps, {:ok, []}, fn info_map, {:ok, acc} ->
+      case Info.from_map(info_map) do
+        {:ok, info} -> {:cont, {:ok, [info | acc]}}
+        {:error, _} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, infos} -> {:ok, Enum.reverse(infos)}
+      error -> error
+    end
   end
 end

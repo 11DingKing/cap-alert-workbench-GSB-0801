@@ -3,6 +3,11 @@
 暴雨 / 强对流等公共预警（CAP 1.2）的编审工作台：草稿编辑 → 提交复核 → 复核 → 发布，
 发布后内容冻结不可修改，后续变更只能基于已发布版本发起**更正（Update）**或**解除（Cancel）**。
 
+一条 CAP 文档支持**多个 info 段**，每段独立携带 severity/urgency/certainty、
+headline/description 与 area（geocode），可表达「440800 维持 Severe、440900 升级
+Extreme」这类分地区预警。更正/解除消息标识从消息流稳定标识派生
+（`-C1`、`-C2`…更正，`-X1`…解除），`references` 精确指向其派生的已发布文档。
+
 技术栈：Elixir 1.20 / OTP 29、Phoenix 1.8、Phoenix LiveView、Ecto + PostgreSQL 17。
 
 ## 架构约定
@@ -34,6 +39,10 @@ mix phx.server     # 或 iex -S mix phx.server
 访问 <http://localhost:4000> 。种子数据包含初始预警 `CN-20260729-GD-RAIN-001`
 （Actual / Alert / Public / zh-CN / Immediate / Severe / Likely，地区编码 440800、440900），
 初始为「编辑中」草稿。
+
+如需演示更正场景，可执行 `mix run priv/repo/setup_c1_scenario.exs`：把首轮发布，
+并生成更正草稿 `CN-20260729-GD-RAIN-001-C1`（两个 info 段：440800 维持 Severe、
+440900 升级 Extreme，差异页按地区展示「440800 未变化、440900 Severe→Extreme」）。
 
 ## 常用命令
 

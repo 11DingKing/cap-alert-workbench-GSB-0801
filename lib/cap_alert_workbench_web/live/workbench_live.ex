@@ -4,6 +4,9 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
 
   只调用 `CapAlertWorkbench.Alerts` 公开用例，绝不直接写状态字段。
   通过 PubSub 订阅消息流，其他浏览器的修改会实时推送刷新。
+
+  草稿表单按 info 段组织（每段独立的 severity/headline/description/area），
+  支持拆分/删除 info 段，保存时经 `Alerts.compose_payload/2` 合成 payload。
   """
   use CapAlertWorkbenchWeb, :live_view
 
@@ -21,6 +24,8 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
         detail: nil,
         diff: nil,
         xml_preview: nil,
+        draft_form: nil,
+        draft_infos: [],
         review_note: ""
       )
       |> stream(:streams, Alerts.list_streams())
@@ -57,41 +62,54 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
     end
   end
 
-  defp assign_draft_form(socket, nil), do: assign(socket, draft_form: nil)
+  defp assign_draft_form(socket, nil) do
+    assign(socket, draft_form: nil, draft_infos: [])
+  end
 
   defp assign_draft_form(socket, version) do
-    payload = version.payload
+    infos =
+      (version.payload["infos"] || [])
+      |> Enum.map(&info_to_form_params/1)
 
+    form_params = %{
+      "status" => version.payload["status"],
+      "lock_version" => version.lock_version,
+      "infos" => infos |> Enum.with_index() |> Map.new(fn {info, i} -> {to_string(i), info} end)
+    }
+
+    assign(socket,
+      draft_form: to_form(form_params, as: :draft),
+      draft_infos: infos
+    )
+  end
+
+  defp info_to_form_params(info) do
     geocodes =
-      (payload["areas"] || [])
+      (info["areas"] || [])
       |> Enum.flat_map(fn area -> area["geocodes"] || [] end)
       |> Enum.map_join(", ", fn gc -> gc["value"] end)
 
     area_desc =
-      case payload["areas"] do
+      case info["areas"] do
         [area | _] -> area["area_desc"]
-        [] -> nil
+        _ -> nil
       end
 
-    params = %{
-      "event" => payload["event"],
-      "headline" => payload["headline"],
-      "description" => payload["description"],
-      "instruction" => payload["instruction"],
-      "language" => payload["language"],
-      "status" => payload["status"],
-      "category" => payload["category"],
-      "urgency" => payload["urgency"],
-      "severity" => payload["severity"],
-      "certainty" => payload["certainty"],
+    %{
+      "event" => info["event"],
+      "headline" => info["headline"],
+      "description" => info["description"],
+      "instruction" => info["instruction"],
+      "language" => info["language"],
+      "category" => info["category"],
+      "urgency" => info["urgency"],
+      "severity" => info["severity"],
+      "certainty" => info["certainty"],
+      "effective" => info["effective"],
+      "expires" => info["expires"],
       "geocodes" => geocodes,
-      "area_desc" => area_desc,
-      "effective" => payload["effective"],
-      "expires" => payload["expires"],
-      "lock_version" => version.lock_version
+      "area_desc" => area_desc
     }
-
-    assign(socket, draft_form: to_form(params, as: :draft))
   end
 
   # -------------------------------------------------------------------
@@ -105,6 +123,42 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
        actor: blank_default(actor, "duty-officer"),
        reviewer: blank_default(reviewer, "reviewer-1")
      )}
+  end
+
+  # 表单输入同步（不持久化），供拆分/删除 info 段时保留未保存输入
+  def handle_event("form_changed", %{"draft" => params}, socket) do
+    {:noreply, assign(socket, draft_infos: infos_from_params(params))}
+  end
+
+  # 拆分 info 段（复制末段内容，清空地区）
+  def handle_event("save_draft", %{"draft" => params, "form_action" => "add_info"}, socket) do
+    infos = infos_from_params(params)
+
+    template =
+      case List.last(infos) do
+        nil -> info_to_form_params(%{})
+        last -> last
+      end
+
+    new_info = %{
+      template
+      | "geocodes" => "",
+        "area_desc" => "",
+        "headline" => "",
+        "description" => ""
+    }
+
+    {:noreply, rebuild_form(socket, params, infos ++ [new_info])}
+  end
+
+  # 删除指定 info 段
+  def handle_event(
+        "save_draft",
+        %{"draft" => params, "form_action" => "remove_info:" <> index},
+        socket
+      ) do
+    infos = infos_from_params(params) |> List.delete_at(String.to_integer(index))
+    {:noreply, rebuild_form(socket, params, infos)}
   end
 
   def handle_event("save_draft", %{"draft" => params}, socket) do
@@ -196,7 +250,15 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
   def handle_event("diff", %{"a" => a_id, "b" => b_id}, socket) do
     with {:ok, a} <- Alerts.get_version(a_id),
          {:ok, b} <- Alerts.get_version(b_id) do
-      {:noreply, assign(socket, diff: %{a: a, b: b, rows: Alerts.diff_versions(a, b)})}
+      {:noreply,
+       assign(socket,
+         diff: %{
+           a: a,
+           b: b,
+           rows: Alerts.diff_versions(a, b),
+           areas: Alerts.diff_areas(a, b)
+         }
+       )}
     else
       {:error, _} -> {:noreply, put_flash(socket, :error, "版本不存在")}
     end
@@ -236,6 +298,25 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
     load_detail(socket, socket.assigns.detail.stream.id)
   end
 
+  defp rebuild_form(socket, params, infos) do
+    form_params = %{
+      "status" => params["status"],
+      "lock_version" => params["lock_version"],
+      "infos" => infos |> Enum.with_index() |> Map.new(fn {info, i} -> {to_string(i), info} end)
+    }
+
+    assign(socket,
+      draft_form: to_form(form_params, as: :draft),
+      draft_infos: infos
+    )
+  end
+
+  defp infos_from_params(params) do
+    (params["infos"] || %{})
+    |> Enum.sort_by(fn {index, _fields} -> String.to_integer(index) end)
+    |> Enum.map(fn {_index, fields} -> fields end)
+  end
+
   defp blank_default("", default), do: default
   defp blank_default(nil, default), do: default
   defp blank_default(value, _default), do: value
@@ -244,22 +325,33 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
   # 错误文案（错误码与 API 一致）
   # -------------------------------------------------------------------
 
-  defp error_message(:stale_lock), do: "乐观锁冲突：草稿已被他人修改，页面已刷新，请基于最新内容重新编辑"
+  defp error_message(:stale_lock),
+    do: "乐观锁冲突：草稿已被他人修改，页面已刷新，请基于最新内容重新编辑"
+
   defp error_message(:stale_review), do: "复核结论已失效：复核期间草稿被修改，请重新复核"
   defp error_message(:already_published), do: "该版本已发布，不能重复发布"
-  defp error_message({:not_publishable, workflow}), do: "当前状态不可发布（#{workflow}），需先复核通过"
+
+  defp error_message({:not_publishable, workflow}),
+    do: "当前状态不可发布（#{workflow}），需先复核通过"
+
   defp error_message(:not_latest_version), do: "只有最新草稿版本可以发布"
   defp error_message(:draft_already_exists), do: "已存在未发布草稿，不能同时发起多个更正/解除"
-  defp error_message({:invalid_transition, from, event}), do: "非法状态转换：#{from} 不能执行 #{event}"
+
+  defp error_message({:invalid_transition, from, event}),
+    do: "非法状态转换：#{from} 不能执行 #{event}"
+
   defp error_message({:unknown_enum, kind, value}), do: "未知枚举值 #{kind}: #{value}"
   defp error_message(:doctype_forbidden), do: "XML 含 DOCTYPE/实体声明，已拒绝"
   defp error_message({:malformed_xml, msg}), do: "XML 解析失败：#{msg}"
 
   defp error_message(errors) when is_list(errors) do
-    Enum.map_join(errors, "；", fn {field, msg} -> "#{field} #{msg}" end)
+    Enum.map_join(errors, "；", fn {field, msg} -> "#{format_field(field)} #{msg}" end)
   end
 
   defp error_message(other), do: "操作失败：#{inspect(other)}"
+
+  defp format_field({:info, index, field}), do: "info#{index + 1}.#{field}"
+  defp format_field(field), do: to_string(field)
 
   # -------------------------------------------------------------------
   # 渲染辅助
@@ -289,6 +381,16 @@ defmodule CapAlertWorkbenchWeb.WorkbenchLive do
   defp msg_type_label(:alert), do: "Alert 首发"
   defp msg_type_label(:update), do: "Update 更正"
   defp msg_type_label(:cancel), do: "Cancel 解除"
+
+  defp area_status_label(:unchanged), do: "未变化"
+  defp area_status_label(:changed), do: "有变更"
+  defp area_status_label(:added), do: "新增地区"
+  defp area_status_label(:removed), do: "移除地区"
+
+  defp area_status_class(:unchanged), do: "bg-zinc-100 text-zinc-600 ring-zinc-500/20"
+  defp area_status_class(:changed), do: "bg-amber-100 text-amber-800 ring-amber-600/20"
+  defp area_status_class(:added), do: "bg-emerald-100 text-emerald-800 ring-emerald-600/20"
+  defp area_status_class(:removed), do: "bg-rose-100 text-rose-800 ring-rose-600/20"
 
   defp enum_options(kind) do
     Enum.map(Enums.values(kind), &Enums.to_cap(kind, &1))
