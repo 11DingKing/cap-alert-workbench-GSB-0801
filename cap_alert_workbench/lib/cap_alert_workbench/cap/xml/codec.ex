@@ -14,7 +14,7 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
       captured and re-emitted, so extension fields round-trip.
   """
 
-  alias CapAlertWorkbench.Cap.{AreaCodes, Enums, Message}
+  alias CapAlertWorkbench.Cap.{AreaCodes, Enums, Info, Message}
   alias CapAlertWorkbench.Cap.Xml.SaxTreeBuilder
 
   @cap_ns "urn:oasis:names:tc:emergency:cap:1.2"
@@ -72,39 +72,44 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
       {:code, "ChangeMe"},
       optional(:note, message.note),
       references_node(message.references),
-      info_node(message),
+      info_nodes(message.infos),
       extension_nodes(message.extensions)
     ]
     |> List.flatten()
     |> Enum.reject(&is_nil/1)
   end
 
-  defp info_node(message) do
+  defp info_nodes(infos) when is_list(infos) do
+    Enum.map(infos, &info_node/1)
+  end
+
+  defp info_node(%Info{} = info) do
     {:info, nil,
      [
-       {:language, message.language},
-       {:category, "Met"},
-       {:event, message.event},
-       {:urgency, Enums.urgency_to_string(message.urgency)},
-       {:severity, Enums.severity_to_string(message.severity)},
-       {:certainty, Enums.certainty_to_string(message.certainty)},
-       optional(:headline, message.headline),
-       optional(:description, message.description),
-       optional(:instruction, message.instruction),
-       area_nodes(message.area_codes, message.area_descriptions)
+       {:language, info.language},
+       {:category, info.category || "Met"},
+       {:event, info.event},
+       {:urgency, Enums.urgency_to_string(info.urgency)},
+       {:severity, Enums.severity_to_string(info.severity)},
+       {:certainty, Enums.certainty_to_string(info.certainty)},
+       optional(:headline, info.headline),
+       optional(:description, info.description),
+       optional(:instruction, info.instruction),
+       area_nodes(info.areas)
      ]
      |> List.flatten()
      |> Enum.reject(&is_nil/1)}
   end
 
-  defp area_nodes(codes, descriptions) do
-    Enum.map(Enum.zip(codes, descriptions), fn {code, desc} ->
+  defp area_nodes(areas) when is_list(areas) do
+    Enum.map(areas, fn area ->
       {:area, nil,
        [
-         {:areaDesc, desc},
+         {:areaDesc, area.description},
          {:polygon, nil, ""},
          {:circle, nil, ""},
-         {:geocode, nil, [{:valueName, "AREA_CODE"}, {:value, code}]},
+         {:geocode, nil,
+          [{:valueName, "AREA_CODE"}, {:value, area.code}]},
          {:altitude, nil, ""},
          {:ceiling, nil, ""}
        ]}
@@ -148,6 +153,14 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
   @doc "Formats a DateTime as a CAP timestamp (yyyy-MM-ddTHH:MM:SS+00:00)."
   def format_ref_time(%DateTime{} = dt) do
     Calendar.strftime(dt, "%Y-%m-%dT%H:%M:%S") <> format_offset(dt)
+  end
+
+  def format_ref_time(text) when is_binary(text) do
+    case DateTime.from_iso8601(text) do
+      {:ok, dt, _} -> format_ref_time(dt)
+      # Already a formatted timestamp with offset
+      _ -> text
+    end
   end
 
   defp format_offset(%DateTime{utc_offset: 0}), do: "+00:00"
@@ -211,7 +224,9 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
 
   defp do_tree_to_message(%{name: "alert", children: children}) do
     fields = collect_text_fields(children)
-    info = find_child(children, "info")
+    info_nodes = find_children(children, "info")
+    infos = Enum.map(info_nodes, &parse_info/1)
+    first_info = List.first(infos)
 
     %Message{
       identifier: fields["identifier"],
@@ -222,19 +237,55 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
       scope: Enums.scope_from_string(fields["scope"]),
       note: fields["note"],
       references: split_refs(fields["references"]),
-      language: get_in(info, [:fields, "language"]) || "zh-CN",
-      urgency: Enums.urgency_from_string(get_in(info, [:fields, "urgency"])),
-      severity: Enums.severity_from_string(get_in(info, [:fields, "severity"])),
-      certainty: Enums.certainty_from_string(get_in(info, [:fields, "certainty"])),
-      event: get_in(info, [:fields, "event"]),
-      headline: get_in(info, [:fields, "headline"]),
-      description: get_in(info, [:fields, "description"]),
-      instruction: get_in(info, [:fields, "instruction"]),
-      area_codes: extract_area_codes(info),
-      area_descriptions: extract_area_descriptions(info),
+      language: first_info_language(first_info),
+      urgency: first_info && first_info.urgency,
+      severity: first_info && first_info.severity,
+      certainty: first_info && first_info.certainty,
+      event: first_info && first_info.event,
+      headline: first_info && first_info.headline,
+      description: first_info && first_info.description,
+      instruction: first_info && first_info.instruction,
+      infos: infos,
+      area_codes: Enum.flat_map(infos, &Info.area_codes/1),
+      area_descriptions: Enum.flat_map(infos, &Info.area_descriptions/1),
       extensions: extract_extensions(children)
     }
   end
+
+  defp first_info_language(nil), do: "zh-CN"
+  defp first_info_language(%Info{language: lang}), do: lang
+
+  defp parse_info(%{children: children} = _node) do
+    fields = collect_text_fields(children)
+    areas = parse_areas(children)
+
+    %Info{
+      language: fields["language"] || "zh-CN",
+      category: fields["category"] || "Met",
+      event: fields["event"],
+      urgency: Enums.urgency_from_string(fields["urgency"]),
+      severity: Enums.severity_from_string(fields["severity"]),
+      certainty: Enums.certainty_from_string(fields["certainty"]),
+      headline: fields["headline"],
+      description: fields["description"],
+      instruction: fields["instruction"],
+      areas: areas
+    }
+  end
+
+  defp parse_areas(children) do
+    children
+    |> Enum.filter(&match?(%{name: "area"}, &1))
+    |> Enum.map(fn area ->
+      fields = collect_text_fields(area.children)
+      geocode = Enum.find(area.children, &match?(%{name: "geocode"}, &1))
+      code = geocode && geocode_fields(geocode) |> Map.get("value")
+      %{code: code, description: fields["areaDesc"] || code}
+    end)
+    |> Enum.reject(&is_nil(&1.code))
+  end
+
+  defp geocode_fields(%{children: children}), do: collect_text_fields(children)
 
   defp collect_text_fields(nodes) do
     Enum.reduce(nodes, %{}, fn
@@ -249,11 +300,8 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
     end)
   end
 
-  defp find_child(nodes, name) do
-    Enum.find_value(nodes, fn
-      %{name: ^name} = node -> %{node: node, fields: collect_text_fields(node.children)}
-      _ -> nil
-    end)
+  defp find_children(nodes, name) do
+    Enum.filter(nodes, &match?(%{name: ^name}, &1))
   end
 
   defp text_content(nodes) do
@@ -261,34 +309,6 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
     |> Enum.filter(&is_binary/1)
     |> Enum.join("")
     |> String.trim()
-  end
-
-  defp extract_area_codes(%{node: info_node}) do
-    info_node.children
-    |> Enum.filter(&match?(%{name: "area"}, &1))
-    |> Enum.map(fn area ->
-      geocode = Enum.find(area.children, &match?(%{name: "geocode"}, &1))
-
-      case geocode do
-        %{children: gc_children} ->
-          fields = collect_text_fields(gc_children)
-          fields["value"]
-
-        _ ->
-          nil
-      end
-    end)
-    |> Enum.reject(&is_nil/1)
-  end
-
-  defp extract_area_descriptions(%{node: info_node}) do
-    info_node.children
-    |> Enum.filter(&match?(%{name: "area"}, &1))
-    |> Enum.map(fn area ->
-      fields = collect_text_fields(area.children)
-      fields["areaDesc"]
-    end)
-    |> Enum.reject(&is_nil/1)
   end
 
   defp extract_extensions(children) do
@@ -330,23 +350,17 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
 
     area_codes = Keyword.get(attrs, :area_codes, ["440800", "440900"])
 
-    descriptions =
+    areas =
       Enum.map(area_codes, fn code ->
-        AreaCodes.description(code) || code
+        %{code: code, description: AreaCodes.description(code) || code}
       end)
 
-    %Message{
-      identifier: Keyword.get(attrs, :identifier, "CN-20260729-GD-RAIN-001"),
-      sender: Keyword.get(attrs, :sender, "xinxi@gd.cma.gov.cn"),
-      sent_at: now,
-      status: Keyword.get(attrs, :status, :actual),
-      msg_type: Keyword.get(attrs, :msg_type, :alert),
-      scope: Keyword.get(attrs, :scope, :public),
+    info = %Info{
       language: Keyword.get(attrs, :language, "zh-CN"),
+      event: Keyword.get(attrs, :event, "暴雨"),
       urgency: Keyword.get(attrs, :urgency, :immediate),
       severity: Keyword.get(attrs, :severity, :severe),
       certainty: Keyword.get(attrs, :certainty, :likely),
-      event: Keyword.get(attrs, :event, "暴雨"),
       headline: Keyword.get(attrs, :headline, "广东省暴雨红色预警"),
       description:
         Keyword.get(
@@ -360,12 +374,29 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
           :instruction,
           "请停止户外作业，远离低洼易涝区和山体滑坡隐患点，关注当地最新预警信息。"
         ),
-      area_codes: area_codes,
-      area_descriptions: descriptions,
+      areas: areas
+    }
+
+    %Message{
+      identifier: Keyword.get(attrs, :identifier, "CN-20260729-GD-RAIN-001"),
+      sender: Keyword.get(attrs, :sender, "xinxi@gd.cma.gov.cn"),
+      sent_at: now,
+      status: Keyword.get(attrs, :status, :actual),
+      msg_type: Keyword.get(attrs, :msg_type, :alert),
+      scope: Keyword.get(attrs, :scope, :public),
+      language: Keyword.get(attrs, :language, "zh-CN"),
+      urgency: info.urgency,
+      severity: info.severity,
+      certainty: info.certainty,
+      event: info.event,
+      headline: info.headline,
+      description: info.description,
+      instruction: info.instruction,
       note: Keyword.get(attrs, :note, nil),
       references: Keyword.get(attrs, :references, []),
       extensions: Keyword.get(attrs, :extensions, []),
-      incidents: Keyword.get(attrs, :incidents, [])
+      incidents: Keyword.get(attrs, :incidents, []),
+      infos: [info]
     }
   end
 end

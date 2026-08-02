@@ -15,6 +15,7 @@ defmodule CapAlertWorkbench.Cap do
     AreaCodes,
     AuditEvent,
     Enums,
+    Info,
     Message,
     OutboxMessage,
     Review,
@@ -22,7 +23,6 @@ defmodule CapAlertWorkbench.Cap do
     VersionDiff,
     VersionStateMachine
   }
-
   alias CapAlertWorkbench.Cap.Xml.Codec, as: XmlCodec
 
   alias CapAlertWorkbench.Repo
@@ -491,7 +491,43 @@ defmodule CapAlertWorkbench.Cap do
   """
   @spec create_correction(String.t(), map(), String.t() | nil) :: result()
   def create_correction(alert_id, attrs, actor \\ nil) do
-    create_follow_up(alert_id, attrs, actor, :correction, :update)
+    create_follow_up(alert_id, attrs, actor, :correction, :update, [])
+  end
+
+  @doc """
+  Issues the specific C1 correction `CN-20260729-GD-RAIN-001-C1` derived from
+  the latest published version.
+
+  Per the scenario: area `440800` stays at `Severe` while area `440900` is
+  upgraded to `Extreme`. This requires two `<info>` segments in one CAP
+  document. The correction's `references` point precisely at the first-round
+  published document (root of the alert thread), not at any intermediate
+  correction.
+
+  The function derives strictly from the latest published version; concurrent
+  publishes are serialised by `FOR UPDATE` so that only one C1 can be created.
+  """
+  @spec create_correction_c1(String.t(), String.t() | nil) :: result()
+  def create_correction_c1(alert_id, actor \\ nil) do
+    c1_identifier = "CN-20260729-GD-RAIN-001-C1"
+
+    attrs = %{
+      "identifier" => c1_identifier,
+      "area_severities" => %{
+        "440800" => :severe,
+        "440900" => :extreme
+      },
+      "headline" => "广东省暴雨红色预警（更正 C1）：茂名升级为 Extreme",
+      "description" =>
+        "更正：湛江市维持 Severe，茂名市升级为 Extreme。两地区分别通过独立的 info 段描述。",
+      "instruction" =>
+        "茂名市按 Extreme 级别响应，湛江市按 Severe 级别响应。"
+    }
+
+    create_follow_up(alert_id, attrs, actor, :correction, :update,
+      identifier: c1_identifier,
+      precise_reference: :root
+    )
   end
 
   @doc """
@@ -500,7 +536,7 @@ defmodule CapAlertWorkbench.Cap do
   """
   @spec create_cancellation(String.t(), map(), String.t() | nil) :: result()
   def create_cancellation(alert_id, attrs, actor \\ nil) do
-    create_follow_up(alert_id, attrs, actor, :cancellation, :cancel)
+    create_follow_up(alert_id, attrs, actor, :cancellation, :cancel, [])
   end
 
   @doc "Diffs two versions by number. Returns `{:ok, changes}` or `:error`."
@@ -564,7 +600,10 @@ defmodule CapAlertWorkbench.Cap do
     XmlCodec.encode!(message)
   end
 
-  defp create_follow_up(alert_id, attrs, actor, kind, msg_type) do
+  defp create_follow_up(alert_id, attrs, actor, kind, msg_type, opts \\ []) do
+    new_identifier = Keyword.get(opts, :identifier)
+    precise_ref = Keyword.get(opts, :precise_reference)
+
     Multi.new()
     |> Multi.run(:alert_lock, fn repo, _ ->
       alert =
@@ -587,6 +626,16 @@ defmodule CapAlertWorkbench.Cap do
 
       if version, do: {:ok, version}, else: {:error, :no_published_version}
     end)
+    |> Multi.run(:root_version, fn repo, %{alert_lock: alert} ->
+      version =
+        Version
+        |> where([v], v.alert_id == ^alert.id and v.kind == :draft)
+        |> order_by([v], asc: v.version_number)
+        |> limit(1)
+        |> repo.one()
+
+      {:ok, version}
+    end)
     |> Multi.run(:supersede, fn repo, %{published: published} ->
       new_id = Ecto.UUID.generate()
 
@@ -601,6 +650,7 @@ defmodule CapAlertWorkbench.Cap do
                                   %{
                                     alert_lock: alert,
                                     published: published,
+                                    root_version: root_version,
                                     supersede: %{new_id: new_id}
                                   } ->
       next_number = published.version_number + 1
@@ -609,8 +659,21 @@ defmodule CapAlertWorkbench.Cap do
         published.payload
         |> map_to_message()
         |> merge_message(attrs)
+
+      references =
+        case precise_ref do
+          :root when not is_nil(root_version) ->
+            [build_version_reference(root_version)]
+
+          _ ->
+            build_references(alert, published, msg_type)
+        end
+
+      base_message =
+        base_message
         |> Map.put(:msg_type, msg_type)
-        |> Map.put(:references, build_references(alert, published, msg_type))
+        |> Map.put(:references, references)
+        |> maybe_put_identifier(new_identifier)
 
       message =
         case kind do
@@ -622,7 +685,7 @@ defmodule CapAlertWorkbench.Cap do
         end
 
       with {:ok, message} <- Message.validate(message),
-           :ok <- AreaCodes.validate_codes(message.area_codes) do
+           :ok <- AreaCodes.validate_codes(Message.area_codes(message)) do
         xml = XmlCodec.encode!(message)
 
         new_status = if kind == :cancellation, do: :canceled, else: :published
@@ -824,6 +887,42 @@ defmodule CapAlertWorkbench.Cap do
     end
   end
 
+  # Builds a CAP references string that points precisely at one published
+  # version (used by C1 to reference the first-round document only).
+  defp build_version_reference(version) do
+    payload = version.payload
+    sent = payload["sent_at"]
+
+    sent_text =
+      cond do
+        is_struct(sent, DateTime) ->
+          XmlCodec.format_ref_time(sent)
+
+        is_binary(sent) ->
+          case DateTime.from_iso8601(sent) do
+            {:ok, dt, _} -> XmlCodec.format_ref_time(dt)
+            _ -> sent
+          end
+
+        is_map(sent) and not is_struct(sent) ->
+          with {:ok, dt, _} <- DateTime.from_iso8601(sent) do
+            XmlCodec.format_ref_time(dt)
+          else
+            _ -> ""
+          end
+
+        true ->
+          ""
+      end
+
+    sender = payload["sender"]
+    identifier = payload["identifier"]
+    "#{sender},#{identifier},#{sent_text}"
+  end
+
+  defp maybe_put_identifier(message, nil), do: message
+  defp maybe_put_identifier(message, identifier), do: %{message | identifier: identifier}
+
   defp build_audit(alert, action, actor, opts) do
     %AuditEvent{
       alert_id: alert.id,
@@ -877,21 +976,125 @@ defmodule CapAlertWorkbench.Cap do
   defp merge_message(message, attrs) when is_map(attrs) do
     string_attrs = for {k, v} <- attrs, into: %{}, do: {to_string(k), v}
 
-    Enum.reduce(string_attrs, message, fn
-      {"event", v}, acc -> %{acc | event: v}
-      {"headline", v}, acc -> %{acc | headline: v}
-      {"description", v}, acc -> %{acc | description: v}
-      {"instruction", v}, acc -> %{acc | instruction: v}
-      {"note", v}, acc -> %{acc | note: v}
-      {"urgency", v}, acc -> %{acc | urgency: cast_enum(v, &Enums.cast_urgency/1)}
-      {"severity", v}, acc -> %{acc | severity: cast_enum(v, &Enums.cast_severity/1)}
-      {"certainty", v}, acc -> %{acc | certainty: cast_enum(v, &Enums.cast_certainty/1)}
-      {"scope", v}, acc -> %{acc | scope: cast_enum(v, &Enums.cast_scope/1)}
-      {"status", v}, acc -> %{acc | status: cast_enum(v, &Enums.cast_status/1)}
-      {"area_codes", v}, acc -> %{acc | area_codes: List.wrap(v)}
-      {"area_descriptions", v}, acc -> %{acc | area_descriptions: List.wrap(v)}
-      _, acc -> acc
-    end)
+    message =
+      Enum.reduce(string_attrs, message, fn
+        {"event", v}, acc ->
+          update_all_infos(acc, fn info -> %{info | event: v} end)
+
+        {"headline", v}, acc ->
+          update_all_infos(acc, fn info -> %{info | headline: v} end)
+
+        {"description", v}, acc ->
+          update_all_infos(acc, fn info -> %{info | description: v} end)
+
+        {"instruction", v}, acc ->
+          update_all_infos(acc, fn info -> %{info | instruction: v} end)
+
+        {"note", v}, acc ->
+          %{acc | note: v}
+
+        {"urgency", v}, acc ->
+          update_all_infos(acc, fn info ->
+            %{info | urgency: cast_enum(v, &Enums.cast_urgency/1)}
+          end)
+
+        {"severity", v}, acc ->
+          update_all_infos(acc, fn info ->
+            %{info | severity: cast_enum(v, &Enums.cast_severity/1)}
+          end)
+
+        {"certainty", v}, acc ->
+          update_all_infos(acc, fn info ->
+            %{info | certainty: cast_enum(v, &Enums.cast_certainty/1)}
+          end)
+
+        {"scope", v}, acc ->
+          %{acc | scope: cast_enum(v, &Enums.cast_scope/1)}
+
+        {"status", v}, acc ->
+          %{acc | status: cast_enum(v, &Enums.cast_status/1)}
+
+        {"infos", v}, acc when is_list(v) ->
+          %{acc | infos: Enum.map(v, &info_from_map/1)}
+
+        {"area_severities", v}, acc when is_map(v) ->
+          apply_area_severities(acc, v)
+
+        _, acc ->
+          acc
+      end)
+
+    sync_message_fields(message)
+  end
+
+  # Applies a severity override per area code, e.g. %{"440900" => :extreme}.
+  # Existing info segments that contain a matching area are split so that the
+  # matched area gets its own segment with the new severity.
+  defp apply_area_severities(message, area_severities) do
+    infos =
+      Enum.flat_map(message.infos, fn info ->
+        {matched, rest} =
+          Enum.split_with(info.areas, fn area ->
+            Map.has_key?(area_severities, area.code)
+          end)
+
+        rest_infos =
+          if rest == [] do
+            []
+          else
+            [%{info | areas: rest}]
+          end
+
+        matched_infos =
+          Enum.map(matched, fn area ->
+            %{
+              info
+              | areas: [area],
+                severity:
+                  cast_enum(
+                    Map.get(area_severities, area.code),
+                    &Enums.cast_severity/1
+                  )
+            }
+          end)
+
+        rest_infos ++ matched_infos
+      end)
+
+    %{message | infos: infos}
+  end
+
+  defp update_all_infos(message, fun) do
+    %{message | infos: Enum.map(message.infos, fun)}
+  end
+
+  # Keep the top-level convenience fields in sync with the first info segment
+  # after a merge, so callers that read message.severity etc. see the default.
+  defp sync_message_fields(message) do
+    message =
+      case message.infos do
+        [first | _] ->
+          %{
+            message
+            | language: first.language,
+              urgency: first.urgency,
+              severity: first.severity,
+              certainty: first.certainty,
+              event: first.event,
+              headline: first.headline,
+              description: first.description,
+              instruction: first.instruction
+          }
+
+        [] ->
+          message
+      end
+
+    %{
+      message
+      | area_codes: Message.area_codes(message),
+        area_descriptions: Message.area_descriptions(message)
+    }
   end
 
   defp cast_enum(value, caster) when is_binary(value) do
@@ -920,16 +1123,75 @@ defmodule CapAlertWorkbench.Cap do
       "description" => message.description,
       "instruction" => message.instruction,
       "note" => message.note,
-      "area_codes" => message.area_codes,
-      "area_descriptions" => message.area_descriptions,
+      "infos" => Enum.map(message.infos, &info_to_map/1),
+      "area_codes" => Message.area_codes(message),
+      "area_descriptions" => Message.area_descriptions(message),
       "references" => message.references,
       "extensions" => encode_extensions(message.extensions)
     }
   end
 
+  defp info_to_map(%Info{} = info) do
+    %{
+      "language" => info.language,
+      "event" => info.event,
+      "urgency" => Atom.to_string(info.urgency),
+      "severity" => Atom.to_string(info.severity),
+      "certainty" => Atom.to_string(info.certainty),
+      "headline" => info.headline,
+      "description" => info.description,
+      "instruction" => info.instruction,
+      "category" => info.category,
+      "areas" =>
+        Enum.map(info.areas, fn area ->
+          %{"code" => area.code, "description" => area.description}
+        end)
+    }
+  end
+
+  defp info_from_map(%Info{} = info), do: info
+
+  defp info_from_map(map) when is_map(map) do
+    %Info{
+      language: map["language"] || map[:language] || "zh-CN",
+      event: map["event"] || map[:event],
+      urgency: atomize(map["urgency"] || map[:urgency], Enums.urgencies()),
+      severity: atomize(map["severity"] || map[:severity], Enums.severities()),
+      certainty: atomize(map["certainty"] || map[:certainty], Enums.certainties()),
+      headline: map["headline"] || map[:headline],
+      description: map["description"] || map[:description],
+      instruction: map["instruction"] || map[:instruction],
+      category: map["category"] || map[:category] || "Met",
+      areas: parse_areas(map["areas"] || map[:areas] || [])
+    }
+  end
+
+  defp parse_areas(areas) when is_list(areas) do
+    Enum.map(areas, fn
+      %{"code" => code, "description" => desc} -> %{code: code, description: desc}
+      %{code: code, description: desc} -> %{code: code, description: desc}
+      code when is_binary(code) -> %{code: code, description: AreaCodes.description(code) || code}
+    end)
+  end
+
+  defp parse_areas(_), do: []
+
   defp map_to_message(%Message{} = m), do: m
 
   defp map_to_message(payload) when is_map(payload) do
+    infos =
+      case payload["infos"] do
+        [_ | _] = infos ->
+          Enum.map(infos, &info_from_map/1)
+
+        _ ->
+          # Legacy payload without infos; reconstruct a single info segment
+          # from the top-level fields and area_codes.
+          [reconstruct_info(payload)]
+      end
+
+    first = List.first(infos)
+
     %Message{
       identifier: payload["identifier"],
       sender: payload["sender"],
@@ -937,19 +1199,45 @@ defmodule CapAlertWorkbench.Cap do
       status: atomize(payload["status"], Enums.statuses()),
       msg_type: atomize(payload["msg_type"], Enums.msg_types()),
       scope: atomize(payload["scope"], Enums.scopes()),
+      language: first && first.language,
+      urgency: first && first.urgency,
+      severity: first && first.severity,
+      certainty: first && first.certainty,
+      event: first && first.event,
+      headline: first && first.headline,
+      description: first && first.description,
+      instruction: first && first.instruction,
+      note: payload["note"],
+      references: payload["references"] || [],
+      extensions: decode_extensions(payload["extensions"]),
+      infos: infos,
+      area_codes: payload["area_codes"] || Enum.flat_map(infos, &Info.area_codes/1),
+      area_descriptions:
+        payload["area_descriptions"] || Enum.flat_map(infos, &Info.area_descriptions/1)
+    }
+  end
+
+  defp reconstruct_info(payload) do
+    codes = payload["area_codes"] || []
+    descs = payload["area_descriptions"] || []
+
+    areas =
+      codes
+      |> Enum.zip(descs)
+      |> Enum.map(fn {code, desc} ->
+        %{code: code, description: desc || AreaCodes.description(code) || code}
+      end)
+
+    %Info{
       language: payload["language"] || "zh-CN",
+      event: payload["event"],
       urgency: atomize(payload["urgency"], Enums.urgencies()),
       severity: atomize(payload["severity"], Enums.severities()),
       certainty: atomize(payload["certainty"], Enums.certainties()),
-      event: payload["event"],
       headline: payload["headline"],
       description: payload["description"],
       instruction: payload["instruction"],
-      note: payload["note"],
-      area_codes: payload["area_codes"] || [],
-      area_descriptions: payload["area_descriptions"] || [],
-      references: payload["references"] || [],
-      extensions: decode_extensions(payload["extensions"])
+      areas: areas
     }
   end
 
