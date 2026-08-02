@@ -251,8 +251,8 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     end
   end
 
-  describe "duplicate publish (concurrency)" do
-    test "only one concurrent publish succeeds; the other is rejected" do
+  describe "duplicate publish (idempotency)" do
+    test "concurrent duplicate publishes both succeed but write only one audit/outbox" do
       {_alert, version} = create_alert!()
       version = version |> submit!() |> approve!()
 
@@ -280,12 +280,32 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
           end
         end
 
-      success = Enum.filter(results, &match?({:ok, _}, &1))
-      failures = Enum.filter(results, &match?({:error, _}, &1))
+      # Idempotent: both concurrent/retry calls return :ok
+      assert Enum.all?(results, &match?({:ok, _}, &1))
 
-      assert length(success) == 1
-      assert length(failures) == 1
+      # But exactly one state transition occurred: one audit, one outbox
+      assert count(
+               from a in AuditEvent,
+                 where:
+                   a.alert_identifier == ^version.alert_identifier and a.action == "published"
+             ) == 1
 
+      assert count(
+               from o in NotificationOutbox,
+                 where: o.alert_identifier == ^version.alert_identifier
+             ) == 1
+    end
+
+    test "sequential duplicate publish of an already-published version is idempotent" do
+      {_alert, version} = create_alert!()
+      published = version |> submit!() |> approve!() |> publish!()
+
+      # A stale client still holding the approved struct retries publish
+      assert {:ok, again} = CapAlert.publish(version, "late-publisher")
+      assert again.id == published.id
+      assert again.workflow_state == :published
+
+      # No additional audit or outbox from the replay
       assert count(
                from a in AuditEvent,
                  where:
@@ -554,6 +574,196 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       new_440800 = Enum.find(diff.regions, &(&1.key == "440800"))
       assert new_440800.status == :added
       assert new_440800.new_info.severity == :severe
+    end
+  end
+
+  describe "C2 cancellation as a new alert aggregate" do
+    setup do
+      # Publish round 1, then create + publish C1 (round 2)
+      {_alert, v1} = create_alert!()
+      publish_chain!(v1)
+
+      assert {:ok, %{version: c1_draft}} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => @identifier},
+                 "editor"
+               )
+
+      {:ok, submitted} = CapAlert.submit_for_review(c1_draft, "editor")
+      {:ok, approved} = CapAlert.review(submitted, :approve, "ok", "reviewer")
+      {:ok, published_c1} = CapAlert.publish(approved, "publisher")
+
+      c1_id = "#{@identifier}-C1"
+      %{c1_id: c1_id, published_c1: published_c1}
+    end
+
+    test "derive_c2_identifier replaces -C1 suffix with -C2" do
+      assert CapAlert.derive_c2_identifier(@identifier <> "-C1") == @identifier <> "-C2"
+      assert CapAlert.derive_c2_identifier("CN-X-C1") == "CN-X-C2"
+      assert CapAlert.derive_c2_identifier("CN-PLAIN") == "CN-PLAIN-C2"
+    end
+
+    test "creates C2 that references the round-2 C1 and preserves multi-info", %{
+      c1_id: c1_id,
+      published_c1: c1
+    } do
+      assert {:ok, %{alert: c2_alert, version: c2}} =
+               CapAlert.create_cancellation_alert(
+                 %{"source_identifier" => c1_id},
+                 "editor"
+               )
+
+      assert c2_alert.identifier == @identifier <> "-C2"
+      assert c2.msg_type == :cancel
+      assert c2.status == :actual
+      assert c2.workflow_state == :draft
+      assert c2.based_on_version_id == c1.id
+
+      # References point precisely at the round-2 published C1
+      first_round_c1 = CapAlert.first_published_version(c1_id)
+      assert first_round_c1.id == c1.id
+
+      assert c2.references ==
+               "#{c1.sender},#{c1_id},#{DateTime.to_iso8601(c1.sent)}"
+
+      # Multi-info parsing result from round 3 is preserved verbatim
+      assert length(c2.infos) == 2
+      by_region = Map.new(c2.infos, fn i -> {hd(i.geocodes).value, i} end)
+      assert by_region["440800"].severity == :severe
+      assert by_region["440900"].severity == :extreme
+    end
+
+    test "C2 can be reviewed and published; every transition is audited; chain viewable", %{
+      c1_id: c1_id,
+      published_c1: c1
+    } do
+      assert {:ok, %{version: c2_draft}} =
+               CapAlert.create_cancellation_alert(
+                 %{"source_identifier" => c1_id},
+                 "editor"
+               )
+
+      {:ok, submitted} = CapAlert.submit_for_review(c2_draft, "editor")
+      {:ok, approved} = CapAlert.review(submitted, :approve, "cancel ok", "reviewer")
+      assert {:ok, published_c2} = CapAlert.publish(approved, "publisher")
+
+      c2_id = @identifier <> "-C2"
+
+      # Every state transition has an audit record
+      actions =
+        c2_id
+        |> CapAlert.list_audit_events()
+        |> Enum.map(& &1.action)
+        |> Enum.sort()
+
+      assert actions == ["approve", "c2_created", "published", "submit"]
+
+      # Outbox for the cancellation
+      outbox = CapAlert.list_outbox(c2_id)
+      assert length(outbox) == 1
+      assert hd(outbox).event_type == "alert.cancel"
+
+      # The C2 published XML is a Cancel referencing C1 with two infos
+      xml = published_c2.xml_payload
+      assert xml =~ ~r(<msgType>\s*Cancel\s*</msgType>)
+      assert xml =~ ~r(<severity>\s*Severe\s*</severity>)
+      assert xml =~ ~r(<severity>\s*Extreme\s*</severity>)
+      assert xml =~ c1_id
+
+      # Full version chain remains viewable across rounds:
+      # C2 -> based_on C1 -> based_on round 1
+      assert published_c2.based_on_version_id == c1.id
+      source_c1 = CapAlert.based_on_version(published_c2)
+      assert source_c1.alert_identifier == c1_id
+      assert source_c1.workflow_state == :published
+
+      source_round1 = CapAlert.based_on_version(source_c1)
+      assert source_round1.alert_identifier == @identifier
+      assert source_round1.workflow_state == :published
+
+      # Round 1 and C1 are still present and untouched
+      assert length(CapAlert.list_versions(@identifier)) == 1
+      assert length(CapAlert.list_versions(c1_id)) == 1
+      assert CapAlert.get_version!(c1.id).workflow_state == :published
+    end
+
+    test "duplicate concurrent C2 creation yields only one alert/version and no pre-publish outbox",
+         %{c1_id: c1_id} do
+      parent = self()
+      ref = make_ref()
+
+      tasks =
+        for i <- 1..2 do
+          Task.async(fn ->
+            Ecto.Adapters.SQL.Sandbox.allow(CapAlertWorkbench.Repo, parent, self())
+
+            result =
+              CapAlert.create_cancellation_alert(
+                %{"source_identifier" => c1_id},
+                "c2-browser-#{i}"
+              )
+
+            send(parent, {ref, i, result})
+            result
+          end)
+        end
+
+      Task.await_many(tasks, 10_000)
+
+      results =
+        for _ <- 1..2 do
+          receive do
+            {^ref, _i, result} -> result
+          after
+            5_000 -> flunk("timeout waiting for c2 result")
+          end
+        end
+
+      assert length(Enum.filter(results, &match?({:ok, _}, &1))) == 1
+      assert length(Enum.filter(results, &match?({:error, _}, &1))) == 1
+
+      c2_id = @identifier <> "-C2"
+      assert CapAlert.get_alert(c2_id) != nil
+      assert length(CapAlert.list_versions(c2_id)) == 1
+
+      assert count(
+               from a in AuditEvent,
+                 where: a.alert_identifier == ^c2_id and a.action == "c2_created"
+             ) == 1
+
+      # No outbox until C2 is actually published
+      assert count(from o in NotificationOutbox, where: o.alert_identifier == ^c2_id) == 0
+    end
+
+    test "idempotent publish of C2: duplicate publish does not duplicate audit/outbox", %{
+      c1_id: c1_id
+    } do
+      assert {:ok, %{version: c2_draft}} =
+               CapAlert.create_cancellation_alert(
+                 %{"source_identifier" => c1_id},
+                 "editor"
+               )
+
+      {:ok, submitted} = CapAlert.submit_for_review(c2_draft, "editor")
+      {:ok, approved} = CapAlert.review(submitted, :approve, "ok", "reviewer")
+      {:ok, published} = CapAlert.publish(approved, "publisher")
+
+      # Replay with the stale approved struct -> idempotent success
+      assert {:ok, again} = CapAlert.publish(approved, "late-publisher")
+      assert again.id == published.id
+      assert again.workflow_state == :published
+
+      c2_id = @identifier <> "-C2"
+
+      assert count(
+               from a in AuditEvent,
+                 where: a.alert_identifier == ^c2_id and a.action == "published"
+             ) == 1
+
+      assert count(
+               from o in NotificationOutbox,
+                 where: o.alert_identifier == ^c2_id
+             ) == 1
     end
   end
 

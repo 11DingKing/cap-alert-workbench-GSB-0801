@@ -364,41 +364,61 @@ defmodule CapAlertWorkbench.CapAlert do
         alert = lock_alert(version.alert_identifier)
         locked = lock_version(version.id)
 
-        with :ok <- assert_state_current(version, locked),
-             :ok <- assert_latest(alert, locked),
-             :ok <- assert_publishable(locked, alert),
-             {:ok, next_state} <- StateMachine.transition(locked.workflow_state, :publish),
-             xml_payload <- CapXml.encode(version_to_cap_fields(locked)),
-             changeset <-
-               Changeset.change(locked,
-                 workflow_state: next_state,
-                 published_at: now(),
-                 xml_payload: xml_payload,
-                 status: :actual
-               ),
-             {:ok, updated} <- Repo.update(changeset),
-             {:ok, _prev} <- supersede_previous(alert, updated),
-             {:ok, updated_alert} <-
-               Alert.changeset(alert, %{
-                 published_version_id: updated.id,
-                 state: alert_state_for(updated)
-               })
-               |> Repo.update(),
-             maybe_simulate_failure!(),
-             {:ok, _audit} <-
-               record_audit(alert.identifier, updated.id, actor, "published", %{
-                 "msg_type" => Atom.to_string(updated.msg_type),
-                 "version_number" => updated.version_number
-               }),
-             {:ok, _outbox} <- create_outbox(updated_alert, updated) do
-          updated
-        else
-          {:error, :not_latest} -> Repo.rollback(:not_latest_version)
-          {:error, reason} -> Repo.rollback(reason)
+        cond do
+          # Idempotency: a duplicate/retry publish of an already-published
+          # version succeeds without writing a second audit or outbox row.
+          locked.workflow_state == :published ->
+            {:idempotent, locked}
+
+          true ->
+            with :ok <- assert_state_current(version, locked),
+                 :ok <- assert_latest(alert, locked),
+                 :ok <- assert_publishable(locked, alert),
+                 {:ok, next_state} <- StateMachine.transition(locked.workflow_state, :publish),
+                 xml_payload <- CapXml.encode(version_to_cap_fields(locked)),
+                 changeset <-
+                   Changeset.change(locked,
+                     workflow_state: next_state,
+                     published_at: now(),
+                     xml_payload: xml_payload,
+                     status: :actual
+                   ),
+                 {:ok, updated} <- Repo.update(changeset),
+                 {:ok, _prev} <- supersede_previous(alert, updated),
+                 {:ok, updated_alert} <-
+                   Alert.changeset(alert, %{
+                     published_version_id: updated.id,
+                     state: alert_state_for(updated)
+                   })
+                   |> Repo.update(),
+                 maybe_simulate_failure!(),
+                 {:ok, _audit} <-
+                   record_audit(alert.identifier, updated.id, actor, "published", %{
+                     "msg_type" => Atom.to_string(updated.msg_type),
+                     "version_number" => updated.version_number
+                   }),
+                 {:ok, _outbox} <- create_outbox(updated_alert, updated) do
+              {:published, updated}
+            else
+              {:error, :not_latest} -> Repo.rollback(:not_latest_version)
+              {:error, reason} -> Repo.rollback(reason)
+            end
         end
       end)
 
-    broadcast_on_ok(result, :version_published)
+    case result do
+      {:ok, {:published, updated}} ->
+        broadcast_version(updated.alert_identifier, {:version_published, updated})
+        {:ok, updated}
+
+      # Idempotent replay: return the already-published version without
+      # broadcasting or writing additional audit/outbox records.
+      {:ok, {:idempotent, already}} ->
+        {:ok, already}
+
+      other ->
+        other
+    end
   end
 
   defp assert_publishable(locked, alert) do
@@ -605,6 +625,120 @@ defmodule CapAlertWorkbench.CapAlert do
       other ->
         other
     end
+  end
+
+  @doc """
+  Create a C2 cancellation alert derived from the latest published version of
+  `source_identifier` (typically the round-2 C1 alert).
+
+  The new alert gets the identifier `"<root>-C2"` (or a custom one), its first
+  version has `msgType=Cancel` and `references` pointing precisely at the
+  published source document (the round-2 C1). The multi-info segments from the
+  validated source version are preserved verbatim so the cancellation carries
+  the same per-region severity/area structure.
+
+  Concurrency: the source alert row is locked `FOR UPDATE`, serializing C2
+  creation; the primary-key unique constraint on the new identifier turns a
+  duplicate attempt into a changeset error rather than a second C2/outbox.
+  """
+  @spec create_cancellation_alert(map(), actor()) ::
+          {:ok, map()} | {:error, term()}
+  def create_cancellation_alert(attrs, actor \\ "editor") do
+    attrs = normalize_keys(attrs)
+
+    source_id = attrs["source_identifier"] || attrs[:source_identifier]
+
+    result =
+      Repo.transaction(fn ->
+        source_alert = lock_alert(source_id)
+
+        source_version =
+          if source_alert.published_version_id do
+            lock_version(source_alert.published_version_id)
+          end
+
+        if is_nil(source_version) do
+          Repo.rollback(:no_published_version)
+        else
+          new_identifier =
+            case attrs["identifier"] do
+              id when is_binary(id) and id != "" -> id
+              _ -> derive_c2_identifier(source_id)
+            end
+
+          referenced = first_published_version(source_id) || source_version
+          references = build_references(referenced)
+
+          new_alert_attrs = %{
+            "identifier" => new_identifier,
+            "sender" => source_version.sender,
+            "state" => "active"
+          }
+
+          with {:ok, new_alert} <-
+                 %Alert{} |> Alert.changeset(new_alert_attrs) |> Repo.insert(),
+               number = next_version_number(new_identifier),
+               params = %{
+                 "alert_identifier" => new_identifier,
+                 "version_number" => number,
+                 "workflow_state" => "draft",
+                 "status" => "actual",
+                 "msg_type" => "cancel",
+                 "scope" => Atom.to_string(source_version.scope),
+                 "sender" => source_version.sender,
+                 "sent" => now(),
+                 "references" => references,
+                 "based_on_version_id" => source_version.id,
+                 "infos" => infos_to_params(source_version.infos),
+                 "extensions" => encode_elements(source_version.extensions)
+               },
+               changeset = %AlertVersion{lock_version: 0} |> AlertVersion.changeset(params),
+               {:ok, new_version} <- Repo.insert(changeset),
+               {:ok, _} <-
+                 Alert.changeset(new_alert, %{latest_version_id: new_version.id})
+                 |> Repo.update(),
+               {:ok, _audit} <-
+                 record_audit(new_identifier, new_version.id, actor, "c2_created", %{
+                   "source_identifier" => source_id,
+                   "based_on_version_id" => source_version.id,
+                   "references" => references
+                 }) do
+            %{alert: new_alert, version: new_version}
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        end
+      end)
+
+    case result do
+      {:ok, %{alert: alert} = data} ->
+        broadcast_alert(alert.identifier, {:alert_created, alert})
+        {:ok, data}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Derive the C2 identifier from a source (typically C1). A trailing `-C1` is
+  replaced with `-C2` (so `CN-...-001-C1` becomes `CN-...-001-C2`); otherwise
+  `-C2` is appended.
+  """
+  def derive_c2_identifier(source_id) do
+    replaced = String.replace_suffix(source_id, "-C1", "-C2")
+    if replaced == source_id, do: source_id <> "-C2", else: replaced
+  end
+
+  @doc """
+  Resolve the version a version was based on (across alert aggregates),
+  enabling navigation of the full round chain (round 1 -> C1 -> C2).
+  """
+  @spec based_on_version(AlertVersion.t()) :: AlertVersion.t() | nil
+  def based_on_version(%AlertVersion{based_on_version_id: nil}), do: nil
+
+  def based_on_version(%AlertVersion{based_on_version_id: id}) do
+    AlertVersion |> Repo.get(id)
   end
 
   @doc """

@@ -125,6 +125,28 @@ defmodule CapAlertWorkbenchWeb.API.AlertController do
     end
   end
 
+  def create_c2(conn, %{"identifier" => identifier} = params) do
+    attrs =
+      params
+      |> Map.drop(["identifier"])
+      |> Map.put("source_identifier", identifier)
+
+    case CapAlert.create_cancellation_alert(attrs, actor(conn)) do
+      {:ok, %{alert: alert, version: version}} ->
+        conn
+        |> put_status(:created)
+        |> json(%{
+          data: %{
+            alert: alert_json(alert),
+            version: version_json(version)
+          }
+        })
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def import(conn, %{"xml" => xml}) do
     case CapAlert.import_cap(xml, actor(conn)) do
       {:ok, result} ->

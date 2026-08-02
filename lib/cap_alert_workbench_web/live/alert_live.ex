@@ -294,6 +294,27 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
     end
   end
 
+  def handle_event("create_c2", _, socket) do
+    attrs = %{"source_identifier" => socket.assigns.identifier}
+
+    case CapAlert.create_cancellation_alert(attrs, socket.assigns.actor) do
+      {:ok, %{alert: alert}} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "已创建解除 C2（Cancel），保留多 info 结构，请编辑后提交复核")
+         |> push_navigate(to: ~p"/alerts/#{alert.identifier}")}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, format_changeset_errors(changeset))
+         |> reload_data_preserving_form()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, error_message(reason))}
+    end
+  end
+
   def handle_event("create_cancellation", _, socket) do
     [first_info | _] = socket.assigns.latest.infos
 
@@ -727,6 +748,7 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
         <p class="mb-1 text-xs font-medium uppercase text-slate-400">引用 references</p>
         <p class="break-all font-mono text-xs text-slate-500">{@latest.references}</p>
       </div>
+      <.version_chain latest={@latest} />
       <div :if={@latest.review_comment} class="mt-3">
         <p class="mb-1 text-xs font-medium uppercase text-slate-400">复核意见</p>
         <p class="text-sm text-slate-600">{@latest.review_comment} — {@latest.reviewed_by}</p>
@@ -800,13 +822,27 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
         <button
           :if={
             @published && @published.workflow_state == :published &&
-              @latest.workflow_state in [:published, :superseded, :cancelled]
+              @latest.workflow_state in [:published, :superseded, :cancelled] &&
+              is_nil(@latest.based_on_version_id)
           }
           type="button"
           phx-click="create_c1"
           class="btn btn-warning btn-sm bg-amber-500 text-white hover:bg-amber-600"
         >
           <.icon name="hero-pencil" class="size-4" /> 创建更正 C1（440900→Extreme）
+        </button>
+
+        <button
+          :if={
+            @published && @published.workflow_state == :published &&
+              @latest.workflow_state in [:published, :superseded, :cancelled] &&
+              @latest.msg_type == :update
+          }
+          type="button"
+          phx-click="create_c2"
+          class="btn btn-error btn-sm bg-rose-600 text-white hover:bg-rose-700"
+        >
+          <.icon name="hero-x-circle" class="size-4" /> 创建解除 C2（Cancel，保留多 info）
         </button>
 
         <button
@@ -828,9 +864,9 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
           }
           type="button"
           phx-click="create_cancellation"
-          class="btn btn-error btn-sm bg-rose-600 text-white hover:bg-rose-700"
+          class="btn btn-ghost btn-sm text-rose-700"
         >
-          <.icon name="hero-x-circle" class="size-4" /> 创建解除 (Cancel)
+          <.icon name="hero-x-circle" class="size-4" /> 同标识解除 (Cancel)
         </button>
       </div>
     </section>
@@ -911,6 +947,28 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
     <div>
       <p class="text-xs uppercase tracking-wide text-slate-400">{@label}</p>
       <p class="mt-0.5 text-sm text-slate-700">{@value || "—"}</p>
+    </div>
+    """
+  end
+
+  attr :latest, :any, required: true
+
+  defp version_chain(assigns) do
+    source = CapAlert.based_on_version(assigns.latest)
+
+    assigns = assign(assigns, :source, source)
+
+    ~H"""
+    <div :if={@source} class="mt-3">
+      <p class="mb-1 text-xs font-medium uppercase text-slate-400">版本链（上一轮）</p>
+      <.link
+        navigate={~p"/alerts/#{@source.alert_identifier}"}
+        class="text-xs text-sky-600 hover:underline"
+      >
+        ← {@source.alert_identifier} · v{@source.version_number} · {Enums.cap_msg_type_string(
+          @source.msg_type
+        )}
+      </.link>
     </div>
     """
   end
