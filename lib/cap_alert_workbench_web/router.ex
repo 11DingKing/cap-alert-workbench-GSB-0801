@@ -39,6 +39,7 @@ defmodule CapAlertWorkbenchWeb.Router do
     post "/alerts/:identifier/versions/:id/publish", API.AlertController, :publish
     post "/alerts/:identifier/corrections", API.AlertController, :create_correction
     post "/alerts/:identifier/cancellations", API.AlertController, :create_cancellation
+    post "/alerts/:identifier/c1", API.AlertController, :create_c1
 
     post "/import", API.AlertController, :import
   end

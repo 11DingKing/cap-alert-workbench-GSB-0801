@@ -93,7 +93,7 @@ defmodule CapAlertWorkbenchWeb.ReviewLive do
           <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <div class="mb-4 flex items-center justify-between">
               <h1 class="text-lg font-semibold text-slate-900">
-                复核 v{@version.version_number} · {@version.event}
+                复核 v{@version.version_number} · {Enums.cap_msg_type_string(@version.msg_type)}
               </h1>
               {state_badge(@version.workflow_state)}
             </div>
@@ -106,28 +106,44 @@ defmodule CapAlertWorkbenchWeb.ReviewLive do
                 label="CAP 状态/类型"
                 value={"#{Enums.cap_status_string(@version.status)} / #{Enums.cap_msg_type_string(@version.msg_type)}"}
               />
-              <.field label="紧急度" value={Enums.cap_urgency_string(@version.urgency)} />
-              <.field label="严重度" value={Enums.cap_severity_string(@version.severity)} />
-              <.field label="确定性" value={Enums.cap_certainty_string(@version.certainty)} />
-              <.field label="区域编码" value={CapAlertUI.geocodes_summary(@version.geocodes)} />
+              <.field label="范围" value={Enums.cap_scope_string(@version.scope)} />
             </div>
 
-            <div class="mt-4 space-y-3 text-sm">
-              <div>
-                <p class="mb-1 font-medium text-slate-700">标题</p>
-                <p class="text-slate-600">{@version.headline || "—"}</p>
-              </div>
-              <div>
-                <p class="mb-1 font-medium text-slate-700">描述</p>
-                <p class="whitespace-pre-wrap text-slate-600">{@version.description || "—"}</p>
-              </div>
-              <div>
-                <p class="mb-1 font-medium text-slate-700">处置建议</p>
-                <p class="whitespace-pre-wrap text-slate-600">{@version.instruction || "—"}</p>
-              </div>
-              <div :if={@version.references}>
-                <p class="mb-1 font-medium text-slate-700">引用</p>
-                <p class="break-all font-mono text-xs text-slate-500">{@version.references}</p>
+            <div :if={@version.references} class="mt-3">
+              <p class="mb-1 text-xs font-medium uppercase text-slate-400">引用</p>
+              <p class="break-all font-mono text-xs text-slate-500">{@version.references}</p>
+            </div>
+
+            <div class="mt-5 space-y-3">
+              <div
+                :for={{info, idx} <- Enum.with_index(@version.infos)}
+                class="rounded-lg border border-slate-200 bg-slate-50/60 p-3"
+              >
+                <div class="mb-2 flex flex-wrap items-center gap-2">
+                  <span class="text-xs font-semibold uppercase text-slate-500">Info #{idx}</span>
+                  {severity_badge(info.severity)}
+                  <span class="text-xs text-slate-400">{CapAlertUI.geocodes_summary(info.geocodes)}</span>
+                </div>
+                <div class="grid gap-2 sm:grid-cols-2 text-sm">
+                  <.field label="事件" value={info.event} />
+                  <.field label="标题" value={info.headline} />
+                  <.field
+                    label="紧急度"
+                    value={info.urgency && Enums.cap_urgency_string(info.urgency)}
+                  />
+                  <.field
+                    label="确定性"
+                    value={info.certainty && Enums.cap_certainty_string(info.certainty)}
+                  />
+                </div>
+                <div class="mt-2 text-sm">
+                  <p class="text-xs uppercase tracking-wide text-slate-400">描述</p>
+                  <p class="whitespace-pre-wrap text-slate-600">{info.description || "—"}</p>
+                </div>
+                <div class="mt-1 text-sm">
+                  <p class="text-xs uppercase tracking-wide text-slate-400">处置建议</p>
+                  <p class="whitespace-pre-wrap text-slate-600">{info.instruction || "—"}</p>
+                </div>
               </div>
             </div>
           </section>
@@ -179,13 +195,22 @@ defmodule CapAlertWorkbenchWeb.ReviewLive do
     ~H"""
     <div>
       <p class="text-xs uppercase tracking-wide text-slate-400">{@label}</p>
-      <p class="mt-0.5 text-slate-700">{@value || "—"}</p>
+      <p class="mt-0.5 text-sm text-slate-700">{@value || "—"}</p>
     </div>
     """
   end
 
   defp state_badge(state) do
     {text, class} = CapAlertUI.workflow_badge(state)
+    assigns = %{text: text, class: class}
+
+    ~H"""
+    <span class={@class}>{@text}</span>
+    """
+  end
+
+  defp severity_badge(severity) do
+    {text, class} = CapAlertUI.cap_severity_badge(severity)
     assigns = %{text: text, class: class}
 
     ~H"""

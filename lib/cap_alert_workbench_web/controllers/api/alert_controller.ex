@@ -103,6 +103,28 @@ defmodule CapAlertWorkbenchWeb.API.AlertController do
     create_followup(conn, identifier, params, :cancellation)
   end
 
+  def create_c1(conn, %{"identifier" => identifier} = params) do
+    attrs =
+      params
+      |> Map.drop(["identifier"])
+      |> Map.put("source_identifier", identifier)
+
+    case CapAlert.create_correction_alert(attrs, actor(conn)) do
+      {:ok, %{alert: alert, version: version}} ->
+        conn
+        |> put_status(:created)
+        |> json(%{
+          data: %{
+            alert: alert_json(alert),
+            version: version_json(version)
+          }
+        })
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
   def import(conn, %{"xml" => xml}) do
     case CapAlert.import_cap(xml, actor(conn)) do
       {:ok, result} ->
@@ -195,17 +217,8 @@ defmodule CapAlertWorkbenchWeb.API.AlertController do
       status: v.status,
       msg_type: v.msg_type,
       scope: v.scope,
-      language: v.language,
-      event: v.event,
-      headline: v.headline,
-      description: v.description,
-      instruction: v.instruction,
-      urgency: v.urgency,
-      severity: v.severity,
-      certainty: v.certainty,
-      area_desc: v.area_desc,
-      geocodes: Enum.map(v.geocodes, &%{value_name: &1.value_name, value: &1.value}),
       references: v.references,
+      infos: Enum.map(v.infos, &info_json/1),
       workflow_state: v.workflow_state,
       review_comment: v.review_comment,
       reviewed_by: v.reviewed_by,
@@ -215,6 +228,21 @@ defmodule CapAlertWorkbenchWeb.API.AlertController do
       xml_payload: v.xml_payload,
       inserted_at: v.inserted_at,
       updated_at: v.updated_at
+    }
+  end
+
+  defp info_json(info) do
+    %{
+      language: info.language,
+      event: info.event,
+      urgency: info.urgency,
+      severity: info.severity,
+      certainty: info.certainty,
+      headline: info.headline,
+      description: info.description,
+      instruction: info.instruction,
+      area_desc: info.area_desc,
+      geocodes: Enum.map(info.geocodes, &%{value_name: &1.value_name, value: &1.value})
     }
   end
 

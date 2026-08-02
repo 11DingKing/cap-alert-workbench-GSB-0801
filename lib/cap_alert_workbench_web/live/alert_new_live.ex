@@ -2,7 +2,7 @@ defmodule CapAlertWorkbenchWeb.AlertNewLive do
   use CapAlertWorkbenchWeb, :live_view
 
   alias CapAlertWorkbench.CapAlert
-  alias CapAlertWorkbench.CapAlert.{Enums, Geocode}
+  alias CapAlertWorkbench.CapAlert.{AlertInfo, AlertVersion, Enums, Geocode}
 
   @impl true
   def mount(_params, _session, socket) do
@@ -11,9 +11,47 @@ defmodule CapAlertWorkbenchWeb.AlertNewLive do
   end
 
   @impl true
-  def handle_event("add_geocode", _params, socket) do
+  def handle_event("add_info", _params, socket) do
     params = socket.assigns.form.params
-    geocodes = params["geocodes"] || %{}
+    infos = params["infos"] || %{}
+
+    next_index =
+      infos |> Map.keys() |> Enum.map(&String.to_integer/1) |> Enum.max(fn -> -1 end)
+
+    new_info = %{
+      "language" => "zh-CN",
+      "event" => "",
+      "headline" => "",
+      "description" => "",
+      "instruction" => "",
+      "urgency" => "immediate",
+      "severity" => "severe",
+      "certainty" => "likely",
+      "area_desc" => "",
+      "geocodes" => %{"0" => %{"value_name" => "Same", "value" => ""}}
+    }
+
+    infos = Map.put(infos, Integer.to_string(next_index + 1), new_info)
+    params = Map.put(params, "infos", infos)
+
+    {:noreply,
+     assign(socket, :form, to_form(build_changeset(params) |> Map.put(:action, :insert)))}
+  end
+
+  def handle_event("remove_info", %{"index" => index}, socket) do
+    params = socket.assigns.form.params
+    infos = Map.delete(params["infos"] || %{}, index)
+    params = Map.put(params, "infos", infos)
+
+    {:noreply,
+     assign(socket, :form, to_form(build_changeset(params) |> Map.put(:action, :insert)))}
+  end
+
+  def handle_event("add_geocode", %{"info-index" => info_index}, socket) do
+    params = socket.assigns.form.params
+    infos = params["infos"] || %{}
+    info = infos[info_index] || %{}
+    geocodes = info["geocodes"] || %{}
 
     next_index =
       geocodes |> Map.keys() |> Enum.map(&String.to_integer/1) |> Enum.max(fn -> -1 end)
@@ -24,17 +62,23 @@ defmodule CapAlertWorkbenchWeb.AlertNewLive do
         "value" => ""
       })
 
-    params = Map.put(params, "geocodes", geocodes)
+    infos = Map.put(infos, info_index, Map.put(info, "geocodes", geocodes))
+    params = Map.put(params, "infos", infos)
 
-    {:noreply, assign(socket, :form, to_form(build_changeset(params)))}
+    {:noreply,
+     assign(socket, :form, to_form(build_changeset(params) |> Map.put(:action, :insert)))}
   end
 
-  def handle_event("remove_geocode", %{"index" => index}, socket) do
+  def handle_event("remove_geocode", %{"info-index" => info_index, "index" => index}, socket) do
     params = socket.assigns.form.params
-    geocodes = Map.delete(params["geocodes"] || %{}, index)
-    params = Map.put(params, "geocodes", geocodes)
+    infos = params["infos"] || %{}
+    info = infos[info_index] || %{}
+    geocodes = Map.delete(info["geocodes"] || %{}, index)
+    infos = Map.put(infos, info_index, Map.put(info, "geocodes", geocodes))
+    params = Map.put(params, "infos", infos)
 
-    {:noreply, assign(socket, :form, to_form(build_changeset(params)))}
+    {:noreply,
+     assign(socket, :form, to_form(build_changeset(params) |> Map.put(:action, :insert)))}
   end
 
   def handle_event("validate", %{"alert_version" => params}, socket) do
@@ -69,11 +113,20 @@ defmodule CapAlertWorkbenchWeb.AlertNewLive do
   end
 
   defp build_changeset(params) do
-    CapAlert.AlertVersion.changeset(
-      %CapAlert.AlertVersion{
-        geocodes: [
-          %Geocode{value_name: "Same", value: "440800"},
-          %Geocode{value_name: "Same", value: "440900"}
+    AlertVersion.changeset(
+      %AlertVersion{
+        infos: [
+          %AlertInfo{
+            language: "zh-CN",
+            event: "暴雨",
+            urgency: :immediate,
+            severity: :severe,
+            certainty: :likely,
+            geocodes: [
+              %Geocode{value_name: "Same", value: "440800"},
+              %Geocode{value_name: "Same", value: "440900"}
+            ]
+          }
         ],
         sent: DateTime.utc_now()
       },
@@ -98,7 +151,6 @@ defmodule CapAlertWorkbenchWeb.AlertNewLive do
             <.input field={@form[:alert_identifier]} label="消息标识 (identifier)" required />
             <.input field={@form[:sender]} label="发送方 (sender)" required />
             <.input field={@form[:sent]} type="datetime-local" label="发送时间 (sent)" required />
-            <.input field={@form[:language]} label="语言 (language)" />
           </div>
         </section>
 
@@ -123,63 +175,102 @@ defmodule CapAlertWorkbenchWeb.AlertNewLive do
               label="范围 scope"
               options={select_opts(Enums.cap_scopes(), &Enums.cap_scope_string/1)}
             />
-            <.input
-              field={@form[:urgency]}
-              type="select"
-              label="紧急度 urgency"
-              options={select_opts(Enums.cap_urgencies(), &Enums.cap_urgency_string/1)}
-            />
-            <.input
-              field={@form[:severity]}
-              type="select"
-              label="严重度 severity"
-              options={select_opts(Enums.cap_severities(), &Enums.cap_severity_string/1)}
-            />
-            <.input
-              field={@form[:certainty]}
-              type="select"
-              label="确定性 certainty"
-              options={select_opts(Enums.cap_certainties(), &Enums.cap_certainty_string/1)}
-            />
-          </div>
-        </section>
-
-        <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 class="mb-4 text-sm font-semibold text-slate-900">内容</h2>
-          <div class="space-y-4">
-            <.input field={@form[:event]} label="事件 event" required />
-            <.input field={@form[:headline]} label="标题 headline" />
-            <.input field={@form[:description]} type="textarea" label="描述 description" rows="3" />
-            <.input
-              field={@form[:instruction]}
-              type="textarea"
-              label="处置建议 instruction"
-              rows="3"
-            />
           </div>
         </section>
 
         <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
           <div class="mb-4 flex items-center justify-between">
-            <h2 class="text-sm font-semibold text-slate-900">区域编码 geocodes</h2>
-            <button type="button" phx-click="add_geocode" class="btn btn-ghost btn-sm">
-              <.icon name="hero-plus" class="size-4" /> 添加区域
+            <h2 class="text-sm font-semibold text-slate-900">Info 段（按地区/语言）</h2>
+            <button type="button" phx-click="add_info" class="btn btn-ghost btn-sm">
+              <.icon name="hero-plus" class="size-4" /> 添加 Info
             </button>
           </div>
 
-          <div class="space-y-2">
-            <.inputs_for :let={g} field={@form[:geocodes]}>
-              <div class="flex gap-2">
-                <.input field={g[:value_name]} class="w-32" placeholder="valueName" />
-                <.input field={g[:value]} class="flex-1" placeholder="区域编码" />
-                <button
-                  type="button"
-                  phx-click="remove_geocode"
-                  phx-value-index={g.index}
-                  class="btn btn-ghost btn-sm text-red-600 self-start mt-6"
-                >
-                  <.icon name="hero-trash" class="size-4" />
-                </button>
+          <div class="space-y-4">
+            <.inputs_for :let={info_f} field={@form[:infos]}>
+              <div class="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+                <div class="mb-3 flex items-center justify-between">
+                  <span class="text-xs font-medium uppercase tracking-wide text-slate-500">
+                    Info #{info_f.index}
+                  </span>
+                  <button
+                    type="button"
+                    phx-click="remove_info"
+                    phx-value-index={info_f.index}
+                    class="btn btn-ghost btn-xs text-red-600"
+                  >
+                    <.icon name="hero-trash" class="size-4" /> 删除
+                  </button>
+                </div>
+
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <.input field={info_f[:event]} label="事件 event" required />
+                  <.input field={info_f[:headline]} label="标题 headline" />
+                  <.input field={info_f[:language]} label="语言 language" />
+                  <.input field={info_f[:area_desc]} label="区域描述 areaDesc" />
+                  <.input
+                    field={info_f[:urgency]}
+                    type="select"
+                    label="紧急度 urgency"
+                    options={select_opts(Enums.cap_urgencies(), &Enums.cap_urgency_string/1)}
+                  />
+                  <.input
+                    field={info_f[:severity]}
+                    type="select"
+                    label="严重度 severity"
+                    options={select_opts(Enums.cap_severities(), &Enums.cap_severity_string/1)}
+                  />
+                  <.input
+                    field={info_f[:certainty]}
+                    type="select"
+                    label="确定性 certainty"
+                    options={select_opts(Enums.cap_certainties(), &Enums.cap_certainty_string/1)}
+                  />
+                </div>
+
+                <.input
+                  field={info_f[:description]}
+                  type="textarea"
+                  label="描述 description"
+                  rows="2"
+                />
+                <.input
+                  field={info_f[:instruction]}
+                  type="textarea"
+                  label="处置建议 instruction"
+                  rows="2"
+                />
+
+                <div class="mt-3">
+                  <div class="mb-2 flex items-center justify-between">
+                    <span class="text-xs font-medium text-slate-600">区域编码 geocodes</span>
+                    <button
+                      type="button"
+                      phx-click="add_geocode"
+                      phx-value-info-index={info_f.index}
+                      class="btn btn-ghost btn-xs"
+                    >
+                      <.icon name="hero-plus" class="size-4" /> 添加区域
+                    </button>
+                  </div>
+                  <div class="space-y-2">
+                    <.inputs_for :let={g} field={info_f[:geocodes]}>
+                      <div class="flex gap-2">
+                        <.input field={g[:value_name]} class="w-32" placeholder="valueName" />
+                        <.input field={g[:value]} class="flex-1" placeholder="区域编码" />
+                        <button
+                          type="button"
+                          phx-click="remove_geocode"
+                          phx-value-info-index={info_f.index}
+                          phx-value-index={g.index}
+                          class="btn btn-ghost btn-sm text-red-600 self-end"
+                        >
+                          <.icon name="hero-trash" class="size-4" />
+                        </button>
+                      </div>
+                    </.inputs_for>
+                  </div>
+                </div>
               </div>
             </.inputs_for>
           </div>

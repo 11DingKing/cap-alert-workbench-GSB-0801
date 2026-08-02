@@ -17,7 +17,7 @@ defmodule CapAlertWorkbenchWeb.CapAlertUI do
       end
 
     {text,
-     "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inspect " <>
+     "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset " <>
        class}
   end
 
@@ -67,4 +67,38 @@ defmodule CapAlertWorkbenchWeb.CapAlertUI do
   end
 
   def geocodes_summary(_), do: ""
+
+  @doc "Summarize all info segments of a version for list views."
+  def infos_summary(nil), do: ""
+
+  def infos_summary(infos) when is_list(infos) do
+    infos
+    |> Enum.map(fn info ->
+      regions =
+        info.geocodes
+        |> Enum.map(fn gc -> gc.value end)
+        |> Enum.join(",")
+
+      severity = info.severity && Enums.cap_severity_string(info.severity)
+      "#{regions} #{severity}"
+    end)
+    |> Enum.join(" · ")
+  end
+
+  def infos_summary(_), do: ""
+
+  @doc "Highest severity across all infos, for a compact header badge."
+  def highest_severity(nil), do: nil
+  def highest_severity([]), do: nil
+
+  def highest_severity(infos) when is_list(infos) do
+    order = %{extreme: 4, severe: 3, moderate: 2, minor: 1, unknown: 0}
+
+    infos
+    |> Enum.map(& &1.severity)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max_by(&Map.get(order, &1, 0), fn -> nil end)
+  end
+
+  def highest_severity(_), do: nil
 end

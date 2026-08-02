@@ -26,5 +26,6 @@ defmodule CapAlertWorkbench.CapAlert.Alert do
     |> cast(attrs, [:identifier, :sender, :latest_version_id, :published_version_id, :state])
     |> validate_required([:identifier, :sender, :state])
     |> validate_format(:identifier, ~r/^[A-Za-z0-9\-_:.]+$/, message: "只能包含字母、数字、连字符、下划线、冒号和点")
+    |> unique_constraint(:identifier, name: :alerts_pkey, message: "该标识已存在")
   end
 end

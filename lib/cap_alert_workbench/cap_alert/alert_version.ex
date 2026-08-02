@@ -3,11 +3,14 @@ defmodule CapAlertWorkbench.CapAlert.AlertVersion do
   An immutable-ish version of an alert. Content may only change while the
   workflow state is `:draft` or `:changes_requested`; updates use an
   optimistic lock (`lock_version`) to detect concurrent edits.
+
+  CAP content that varies per region/language lives in `infos` (a list of
+  `AlertInfo` embeds), mirroring the CAP 1.2 `<info>` structure.
   """
   use Ecto.Schema
   import Ecto.Changeset
 
-  alias CapAlertWorkbench.CapAlert.{Enums, Geocode}
+  alias CapAlertWorkbench.CapAlert.{AlertInfo, Enums}
 
   @primary_key {:id, :id, autogenerate: true}
 
@@ -21,19 +24,8 @@ defmodule CapAlertWorkbench.CapAlert.AlertVersion do
     field :status, Ecto.Enum, values: Enums.cap_statuses()
     field :msg_type, Ecto.Enum, values: Enums.cap_msg_types()
     field :scope, Ecto.Enum, values: Enums.cap_scopes()
-    field :language, :string
 
-    field :event, :string
-    field :headline, :string
-    field :description, :string
-    field :instruction, :string
-
-    field :urgency, Ecto.Enum, values: Enums.cap_urgencies()
-    field :severity, Ecto.Enum, values: Enums.cap_severities()
-    field :certainty, Ecto.Enum, values: Enums.cap_certainties()
-
-    field :area_desc, :string
-    embeds_many :geocodes, Geocode, on_replace: :delete
+    embeds_many :infos, AlertInfo, on_replace: :delete
 
     field :references, :string
     field :extensions, {:array, :map}, default: []
@@ -61,14 +53,13 @@ defmodule CapAlertWorkbench.CapAlert.AlertVersion do
   end
 
   @required_fields ~w(alert_identifier version_number sender sent status msg_type scope workflow_state)a
-  @optional_fields ~w(lock_version language event headline description instruction urgency severity
-    certainty area_desc references extensions review_comment reviewed_by reviewed_at
+  @optional_fields ~w(lock_version references extensions review_comment reviewed_by reviewed_at
     published_at based_on_version_id xml_payload)a
 
   def changeset(version, attrs) do
     version
     |> cast(attrs, @required_fields ++ @optional_fields)
-    |> cast_embed(:geocodes, with: &Geocode.changeset/2)
+    |> cast_embed(:infos, with: &AlertInfo.changeset/2)
     |> validate_required(@required_fields)
     |> validate_inclusion(:status, Enums.cap_statuses())
     |> validate_inclusion(:msg_type, Enums.cap_msg_types())

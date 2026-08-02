@@ -7,6 +7,8 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
     rejected outright, and the scanner is configured with `external_dtd: :none`.
   * Serialization uses `XmlBuilder`, which builds an XML tree (not string
     concatenation) and performs proper escaping of `&`, `<`, `>`, `"` and `'`.
+  * Multiple `<info>` segments are supported and preserved in document order
+    so that the info↔area correspondence is unchanged after a round-trip.
   * Unknown extension elements (including namespace-qualified ones) are
     preserved through an import/export round-trip.
 
@@ -22,6 +24,20 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
   @type element ::
           {String.t(), %{optional(String.t()) => String.t()}, [element | String.t()]}
 
+  @type info_fields :: %{
+          optional(:language) => String.t() | nil,
+          optional(:event) => String.t() | nil,
+          optional(:urgency) => Enums.cap_urgency(),
+          optional(:severity) => Enums.cap_severity(),
+          optional(:certainty) => Enums.cap_certainty(),
+          optional(:headline) => String.t() | nil,
+          optional(:description) => String.t() | nil,
+          optional(:instruction) => String.t() | nil,
+          optional(:area_desc) => String.t() | nil,
+          optional(:geocodes) => [%{value_name: String.t(), value: String.t()}],
+          optional(:info_extensions) => [element()]
+        }
+
   @type cap_fields :: %{
           optional(:identifier) => String.t(),
           optional(:sender) => String.t(),
@@ -30,18 +46,8 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
           optional(:msg_type) => Enums.cap_msg_type(),
           optional(:scope) => Enums.cap_scope(),
           optional(:references) => String.t() | nil,
-          optional(:language) => String.t() | nil,
-          optional(:event) => String.t() | nil,
-          optional(:headline) => String.t() | nil,
-          optional(:description) => String.t() | nil,
-          optional(:instruction) => String.t() | nil,
-          optional(:urgency) => Enums.cap_urgency(),
-          optional(:severity) => Enums.cap_severity(),
-          optional(:certainty) => Enums.cap_certainty(),
-          optional(:area_desc) => String.t() | nil,
-          optional(:geocodes) => [%{value_name: String.t(), value: String.t()}],
-          optional(:alert_extensions) => [element()],
-          optional(:info_extensions) => [element()]
+          optional(:infos) => [info_fields()],
+          optional(:alert_extensions) => [element()]
         }
 
   @doc """
@@ -123,23 +129,25 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
 
   @doc """
   Extract CAP fields from a parsed `<alert>` element. Unknown child elements of
-  `<alert>` and `<info>` are returned as extensions. Only the elements that we
-  actually map into structured fields are removed; other legal CAP elements
-  (e.g. `code`, `note`, `category`) are preserved verbatim.
+  `<alert>` are returned as alert extensions; unknown children of each `<info>`
+  are attached to that info as `info_extensions`. Multiple `<info>` segments
+  are collected in document order.
   """
   @spec extract_cap(element()) :: {:ok, cap_fields()} | {:error, term()}
   def extract_cap({"alert", _attrs, children} = _element) do
     alert_kids = Enum.filter(children, &is_tuple/1)
 
-    {known_alert, alert_extensions} =
-      Enum.split_with(alert_kids, fn {name, _, _} -> name in alert_extracted_names() end)
+    info_elements = Enum.filter(alert_kids, fn {name, _, _} -> name == "info" end)
 
-    info = Enum.find(alert_kids, fn {name, _, _} -> name == "info" end)
+    {known_alert, alert_extensions} =
+      alert_kids
+      |> Enum.reject(fn {name, _, _} -> name == "info" end)
+      |> Enum.split_with(fn {name, _, _} -> name in alert_extracted_names() end)
 
     fields =
       %{}
       |> put_alert_known(known_alert)
-      |> put_info(info)
+      |> Map.put(:infos, Enum.map(info_elements, &extract_info/1))
       |> Map.put(:alert_extensions, alert_extensions)
 
     {:ok, fields}
@@ -147,12 +155,10 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
 
   def extract_cap(_element), do: {:error, :not_an_alert}
 
-  # Alert child elements that are mapped into structured fields.
   defp alert_extracted_names do
-    ~w(identifier sender sent status msgType scope references info)
+    ~w(identifier sender sent status msgType scope references)
   end
 
-  # Info child elements that are mapped into structured fields.
   defp info_extracted_names do
     ~w(language event urgency severity certainty headline description instruction area)
   end
@@ -185,15 +191,13 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
     end)
   end
 
-  defp put_info(fields, nil), do: fields
-
-  defp put_info(fields, {"info", _, children}) do
+  defp extract_info({"info", _, children}) do
     kids = Enum.filter(children, &is_tuple/1)
 
     {known_info, info_extensions} =
       Enum.split_with(kids, fn {name, _, _} -> name in info_extracted_names() end)
 
-    fields
+    %{}
     |> put_info_known(known_info)
     |> Map.put(:info_extensions, info_extensions)
   end
@@ -273,7 +277,8 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
 
   @doc """
   Build a CAP `<alert>` element tree from the given field map. Known fields are
-  emitted in CAP order followed by preserved extension elements.
+  emitted in CAP order followed by preserved extension elements, then one
+  `<info>` element per entry in `infos`.
   """
   @spec build_cap(cap_fields()) :: element()
   def build_cap(fields) do
@@ -289,52 +294,52 @@ defmodule CapAlertWorkbench.CapAlert.CapXml do
       ]
       |> Enum.reject(&is_nil/1)
 
-    info = build_info(fields)
+    infos = Enum.map(fields[:infos] || [], &build_info/1)
 
     children =
       alert_known ++
         Enum.filter(fields[:alert_extensions] || [], &is_tuple/1) ++
-        [info]
+        infos
 
     {"alert", %{"xmlns" => @cap_ns}, children}
   end
 
-  defp build_info(fields) do
+  defp build_info(info) do
     known =
       [
-        text_elem("language", fields[:language]),
-        text_elem("event", fields[:event]),
-        enum_elem("urgency", fields[:urgency], &Enums.cap_urgency_string/1),
-        enum_elem("severity", fields[:severity], &Enums.cap_severity_string/1),
-        enum_elem("certainty", fields[:certainty], &Enums.cap_certainty_string/1),
-        text_elem("headline", fields[:headline]),
-        text_elem("description", fields[:description]),
-        text_elem("instruction", fields[:instruction])
+        text_elem("language", info[:language]),
+        text_elem("event", info[:event]),
+        enum_elem("urgency", info[:urgency], &Enums.cap_urgency_string/1),
+        enum_elem("severity", info[:severity], &Enums.cap_severity_string/1),
+        enum_elem("certainty", info[:certainty], &Enums.cap_certainty_string/1),
+        text_elem("headline", info[:headline]),
+        text_elem("description", info[:description]),
+        text_elem("instruction", info[:instruction])
       ]
       |> Enum.reject(&is_nil/1)
 
     area =
-      if fields[:geocodes] not in [nil, []] or fields[:area_desc] not in [nil, ""] do
-        [build_area(fields)]
+      if info[:geocodes] not in [nil, []] or info[:area_desc] not in [nil, ""] do
+        [build_area(info)]
       else
         []
       end
 
-    extensions = Enum.filter(fields[:info_extensions] || [], &is_tuple/1)
+    extensions = Enum.filter(info[:info_extensions] || [], &is_tuple/1)
 
     {"info", %{}, known ++ extensions ++ area}
   end
 
-  defp build_area(fields) do
+  defp build_area(info) do
     area_desc =
-      case fields[:area_desc] do
+      case info[:area_desc] do
         nil -> []
         "" -> []
         desc -> [text_elem("areaDesc", desc)]
       end
 
     geocodes =
-      Enum.map(fields[:geocodes] || [], fn gc ->
+      Enum.map(info[:geocodes] || [], fn gc ->
         {"geocode", %{},
          [
            text_elem("valueName", gc[:value_name] || gc["value_name"]),

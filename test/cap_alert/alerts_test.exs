@@ -4,24 +4,31 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
   alias CapAlertWorkbench.CapAlert
   alias CapAlertWorkbench.CapAlert.{AuditEvent, NotificationOutbox}
 
+  @identifier "CN-20260729-GD-RAIN-001"
+
   @initial_attrs %{
-    "identifier" => "CN-20260729-GD-RAIN-001",
+    "identifier" => @identifier,
     "sender" => "duty-officer@gd.example",
     "sent" => ~U[2026-07-29 08:00:00Z],
     "status" => "actual",
     "msg_type" => "alert",
     "scope" => "public",
-    "language" => "zh-CN",
-    "event" => "暴雨",
-    "headline" => "暴雨红色预警",
-    "description" => "预计未来6小时降雨量将达100毫米以上",
-    "instruction" => "停止集会、停课、停业",
-    "urgency" => "immediate",
-    "severity" => "severe",
-    "certainty" => "likely",
-    "geocodes" => %{
-      "0" => %{"value_name" => "Same", "value" => "440800"},
-      "1" => %{"value_name" => "Same", "value" => "440900"}
+    "infos" => %{
+      "0" => %{
+        "language" => "zh-CN",
+        "event" => "暴雨",
+        "headline" => "暴雨红色预警",
+        "description" => "预计未来6小时降雨量将达100毫米以上",
+        "instruction" => "停止集会、停课、停业",
+        "urgency" => "immediate",
+        "severity" => "severe",
+        "certainty" => "likely",
+        "area_desc" => "湛江市、茂名市",
+        "geocodes" => %{
+          "0" => %{"value_name" => "Same", "value" => "440800"},
+          "1" => %{"value_name" => "Same", "value" => "440900"}
+        }
+      }
     }
   }
 
@@ -45,27 +52,65 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     p
   end
 
+  defp publish_chain!(version) do
+    version |> submit!() |> approve!() |> publish!()
+  end
+
   defp count(query), do: CapAlertWorkbench.Repo.aggregate(query, :count)
 
+  defp info(version, idx \\ 0), do: Enum.at(version.infos, idx)
+
   describe "create_alert/2" do
-    test "creates the initial draft with the specified CAP fields" do
+    test "creates the initial draft with one info covering two regions" do
       {alert, version} = create_alert!()
 
-      assert alert.identifier == "CN-20260729-GD-RAIN-001"
+      assert alert.identifier == @identifier
       assert alert.latest_version_id == version.id
       assert version.version_number == 1
       assert version.workflow_state == :draft
       assert version.status == :actual
       assert version.msg_type == :alert
       assert version.scope == :public
-      assert version.language == "zh-CN"
-      assert version.urgency == :immediate
-      assert version.severity == :severe
-      assert version.certainty == :likely
-      assert Enum.map(version.geocodes, & &1.value) == ["440800", "440900"]
+      assert length(version.infos) == 1
+
+      info = info(version)
+      assert info.language == "zh-CN"
+      assert info.event == "暴雨"
+      assert info.urgency == :immediate
+      assert info.severity == :severe
+      assert info.certainty == :likely
+      assert Enum.map(info.geocodes, & &1.value) == ["440800", "440900"]
 
       audit = CapAlert.list_audit_events(alert.identifier)
       assert Enum.any?(audit, &(&1.action == "created"))
+    end
+
+    test "supports multiple info segments with independent severity per region" do
+      attrs = %{
+        "identifier" => "CN-MULTI-001",
+        "sender" => "s@example.com",
+        "sent" => ~U[2026-07-29 08:00:00Z],
+        "status" => "actual",
+        "msg_type" => "alert",
+        "scope" => "public",
+        "infos" => %{
+          "0" => %{
+            "event" => "暴雨",
+            "severity" => "severe",
+            "geocodes" => %{"0" => %{"value_name" => "Same", "value" => "440800"}}
+          },
+          "1" => %{
+            "event" => "暴雨",
+            "severity" => "extreme",
+            "geocodes" => %{"0" => %{"value_name" => "Same", "value" => "440900"}}
+          }
+        }
+      }
+
+      {:ok, %{version: version}} = CapAlert.create_alert(attrs, "t")
+      assert length(version.infos) == 2
+      assert Enum.at(version.infos, 0).severity == :severe
+      assert Enum.at(version.infos, 1).severity == :extreme
     end
 
     test "rejects invalid identifier" do
@@ -80,9 +125,26 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       assert version.lock_version == 1
 
       {:ok, updated} =
-        CapAlert.edit_draft(version, %{"headline" => "新标题", "lock_version" => 1}, "editor")
+        CapAlert.edit_draft(
+          version,
+          %{
+            "infos" => %{
+              "0" => %{
+                "event" => "暴雨",
+                "headline" => "新标题",
+                "severity" => "severe",
+                "geocodes" => %{
+                  "0" => %{"value_name" => "Same", "value" => "440800"},
+                  "1" => %{"value_name" => "Same", "value" => "440900"}
+                }
+              }
+            },
+            "lock_version" => 1
+          },
+          "editor"
+        )
 
-      assert updated.headline == "新标题"
+      assert hd(updated.infos).headline == "新标题"
       assert updated.lock_version == 2
 
       audit = CapAlert.list_audit_events(version.alert_identifier)
@@ -92,23 +154,24 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     test "returns :stale when lock_version does not match (optimistic lock)" do
       {_alert, version} = create_alert!()
 
-      # First browser saves successfully, bumping lock_version to 2
       {:ok, _} =
-        CapAlert.edit_draft(version, %{"headline" => "A", "lock_version" => 1}, "browser-1")
+        CapAlert.edit_draft(
+          version,
+          %{"headline" => "A", "lock_version" => 1, "infos" => infos_param(version.infos)},
+          "browser-1"
+        )
 
-      # Second browser still holds lock_version = 1 -> conflict
       assert {:error, :stale} =
                CapAlert.edit_draft(
                  version,
-                 %{"headline" => "B", "lock_version" => 1},
+                 %{"headline" => "B", "lock_version" => 1, "infos" => infos_param(version.infos)},
                  "browser-2"
                )
     end
 
     test "cannot edit a published version" do
       {_alert, version} = create_alert!()
-      version = version |> submit!() |> approve!()
-      {:ok, published} = CapAlert.publish(version, "publisher")
+      published = publish_chain!(version)
 
       assert {:error, :not_editable} =
                CapAlert.edit_draft(published, %{"headline" => "hacked"}, "attacker")
@@ -130,8 +193,9 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       assert published.workflow_state == :published
       assert published.published_at != nil
       assert published.xml_payload =~ "<alert xmlns=\"urn:oasis:names:tc:emergency:cap:1.2\""
-      assert published.xml_payload =~ "CN-20260729-GD-RAIN-001"
+      assert published.xml_payload =~ @identifier
       assert published.xml_payload =~ "440800"
+      assert published.xml_payload =~ "440900"
 
       alert = CapAlert.get_alert!(version.alert_identifier)
       assert alert.published_version_id == published.id
@@ -156,8 +220,16 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       assert rejected.workflow_state == :changes_requested
       assert rejected.review_comment == "请补充区域信息"
 
-      # Can edit again after rejection
-      {:ok, edited} = CapAlert.edit_draft(rejected, %{"description" => "补充"}, "editor")
+      {:ok, edited} =
+        CapAlert.edit_draft(
+          rejected,
+          %{
+            "infos" => infos_param(rejected.infos),
+            "lock_version" => rejected.lock_version
+          },
+          "editor"
+        )
+
       assert edited.workflow_state == :changes_requested
     end
 
@@ -165,13 +237,11 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       {_alert, version} = create_alert!()
       submitted = submit!(version)
 
-      # Author creates a new draft while review is pending
       {:ok, new_draft} = CapAlert.revise(submitted, "author")
       assert new_draft.version_number == 2
       assert new_draft.workflow_state == :draft
 
-      # The old in-review version is no longer latest -> review must fail
-      assert {:error, :not_latest} =
+      assert {:error, :stale_review} =
                CapAlert.review(submitted, :approve, "old conclusion", "reviewer")
     end
 
@@ -216,7 +286,6 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       assert length(success) == 1
       assert length(failures) == 1
 
-      # Exactly one published audit event and one outbox row, no duplicates
       assert count(
                from a in AuditEvent,
                  where:
@@ -243,12 +312,10 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
         Application.delete_env(:cap_alert_workbench, :simulate_publish_failure)
       end
 
-      # Version must remain approved (not published) because the transaction rolled back
       reloaded = CapAlert.get_version!(version.id)
       assert reloaded.workflow_state == :approved
       assert reloaded.published_at == nil
 
-      # No published audit event, no outbox row
       assert count(
                from a in AuditEvent,
                  where:
@@ -262,10 +329,10 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     end
   end
 
-  describe "correction and cancellation" do
+  describe "same-alert correction and cancellation" do
     setup do
       {_alert, version} = create_alert!()
-      published = version |> submit!() |> approve!() |> publish!()
+      published = publish_chain!(version)
       %{published: published}
     end
 
@@ -274,7 +341,7 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     } do
       assert {:ok, correction} =
                CapAlert.create_correction(
-                 %{"alert_identifier" => p.alert_identifier, "headline" => "更新后的标题"},
+                 %{"alert_identifier" => p.alert_identifier},
                  "editor"
                )
 
@@ -283,8 +350,8 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       assert correction.based_on_version_id == p.id
       assert correction.references =~ p.alert_identifier
       assert correction.references =~ p.sender
+      assert length(correction.infos) == length(p.infos)
 
-      # Go through review and publish; original becomes superseded
       {:ok, submitted} = CapAlert.submit_for_review(correction, "editor")
       {:ok, approved} = CapAlert.review(submitted, :approve, "", "reviewer")
       {:ok, new_published} = CapAlert.publish(approved, "publisher")
@@ -299,11 +366,7 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     } do
       assert {:ok, cancellation} =
                CapAlert.create_cancellation(
-                 %{
-                   "alert_identifier" => p.alert_identifier,
-                   "headline" => "预警解除",
-                   "description" => "降雨结束"
-                 },
+                 %{"alert_identifier" => p.alert_identifier},
                  "editor"
                )
 
@@ -333,36 +396,238 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
     end
   end
 
-  describe "version diff" do
-    test "detects changed fields" do
+  describe "C1 correction as a new alert aggregate" do
+    setup do
+      {_alert, version} = create_alert!()
+      published = publish_chain!(version)
+      %{published: published}
+    end
+
+    test "creates CN-...-C1 with two infos: 440800 stays Severe, 440900 becomes Extreme", %{
+      published: p
+    } do
+      assert {:ok, %{alert: c1_alert, version: c1}} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => p.alert_identifier},
+                 "editor"
+               )
+
+      assert c1_alert.identifier == "#{p.alert_identifier}-C1"
+      assert c1.msg_type == :update
+      assert c1.status == :actual
+      assert c1.workflow_state == :draft
+      assert c1.based_on_version_id == p.id
+
+      assert length(c1.infos) == 2
+
+      by_region = Map.new(c1.infos, fn info -> {hd(info.geocodes).value, info} end)
+      assert by_region["440800"].severity == :severe
+      assert by_region["440900"].severity == :extreme
+      assert by_region["440900"].area_desc == "440900"
+    end
+
+    test "references precisely point to the first-round published document", %{published: p} do
+      assert {:ok, %{version: c1}} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => p.alert_identifier},
+                 "editor"
+               )
+
+      first_round = CapAlert.first_published_version(p.alert_identifier)
+      assert first_round.id == p.id
+
+      assert c1.references ==
+               "#{p.sender},#{p.alert_identifier},#{DateTime.to_iso8601(p.sent)}"
+    end
+
+    test "cannot create C1 without a published source version" do
+      {:ok, %{alert: alert}} =
+        CapAlert.create_alert(%{@initial_attrs | "identifier" => "CN-NOPUB-003"}, "t")
+
+      assert {:error, :no_published_version} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => alert.identifier},
+                 "t"
+               )
+    end
+
+    test "duplicate concurrent C1 creation produces only one alert and no duplicate outbox", %{
+      published: p
+    } do
+      parent = self()
+      ref = make_ref()
+
+      tasks =
+        for i <- 1..2 do
+          Task.async(fn ->
+            Ecto.Adapters.SQL.Sandbox.allow(CapAlertWorkbench.Repo, parent, self())
+
+            result =
+              CapAlert.create_correction_alert(
+                %{"source_identifier" => p.alert_identifier},
+                "c1-browser-#{i}"
+              )
+
+            send(parent, {ref, i, result})
+            result
+          end)
+        end
+
+      Task.await_many(tasks, 10_000)
+
+      results =
+        for _ <- 1..2 do
+          receive do
+            {^ref, _i, result} -> result
+          after
+            5_000 -> flunk("timeout waiting for c1 result")
+          end
+        end
+
+      success = Enum.filter(results, &match?({:ok, _}, &1))
+      failures = Enum.filter(results, &match?({:error, _}, &1))
+
+      assert length(success) == 1
+      assert length(failures) == 1
+
+      c1_id = "#{p.alert_identifier}-C1"
+      assert CapAlert.get_alert(c1_id) != nil
+
+      c1_versions = CapAlert.list_versions(c1_id)
+      assert length(c1_versions) == 1
+
+      assert count(
+               from a in AuditEvent,
+                 where: a.alert_identifier == ^c1_id and a.action == "c1_created"
+             ) == 1
+
+      assert count(from o in NotificationOutbox, where: o.alert_identifier == ^c1_id) == 0
+    end
+
+    test "C1 can be reviewed and published; it emits exactly one outbox", %{published: p} do
+      assert {:ok, %{version: c1}} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => p.alert_identifier},
+                 "editor"
+               )
+
+      {:ok, submitted} = CapAlert.submit_for_review(c1, "editor")
+      {:ok, approved} = CapAlert.review(submitted, :approve, "ok", "reviewer")
+      assert {:ok, published_c1} = CapAlert.publish(approved, "publisher")
+      assert published_c1.workflow_state == :published
+
+      outbox = CapAlert.list_outbox("#{p.alert_identifier}-C1")
+      assert length(outbox) == 1
+      assert hd(outbox).event_type == "alert.update"
+
+      xml = published_c1.xml_payload
+      assert xml =~ ~r(<msgType>\s*Update\s*</msgType>)
+      assert xml =~ "<references>"
+      assert xml =~ "440800"
+      assert xml =~ "440900"
+      assert xml =~ ~r(<severity>\s*Extreme\s*</severity>)
+      assert xml =~ ~r(<severity>\s*Severe\s*</severity>)
+    end
+
+    test "per-region diff shows combined region removed and two single regions added", %{
+      published: p
+    } do
+      assert {:ok, %{version: c1}} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => p.alert_identifier},
+                 "editor"
+               )
+
+      diff = CapAlert.diff_versions(p, c1)
+      keys = Enum.map(diff.regions, & &1.key) |> Enum.sort()
+      assert "440800" in keys
+      assert "440900" in keys
+      assert "440800,440900" in keys
+
+      combined = Enum.find(diff.regions, &(&1.key == "440800,440900"))
+      assert combined.status == :removed
+
+      new_440900 = Enum.find(diff.regions, &(&1.key == "440900"))
+      assert new_440900.status == :added
+      assert new_440900.new_info.severity == :extreme
+
+      new_440800 = Enum.find(diff.regions, &(&1.key == "440800"))
+      assert new_440800.status == :added
+      assert new_440800.new_info.severity == :severe
+    end
+  end
+
+  describe "version diff (per region)" do
+    test "detects changed fields within the same region" do
       {_alert, v1} = create_alert!()
-      {:ok, v2} = CapAlert.edit_draft(v1, %{"headline" => "变更后标题"}, "editor")
+
+      {:ok, v2} =
+        CapAlert.edit_draft(
+          v1,
+          %{
+            "infos" => %{
+              "0" => %{
+                "event" => "暴雨",
+                "headline" => "变更后标题",
+                "severity" => "severe",
+                "geocodes" => %{
+                  "0" => %{"value_name" => "Same", "value" => "440800"},
+                  "1" => %{"value_name" => "Same", "value" => "440900"}
+                }
+              }
+            }
+          },
+          "editor"
+        )
 
       diff = CapAlert.diff_versions(v1, v2)
-      headline_change = Enum.find(diff, &(&1.field == :headline))
-      assert headline_change.changed
-      assert headline_change.old =~ "暴雨红色预警"
-      assert headline_change.new == "变更后标题"
-
-      unchanged = Enum.find(diff, &(&1.field == :event))
-      refute unchanged.changed
+      region = Enum.find(diff.regions, &(&1.key == "440800,440900"))
+      assert region.status == :changed
+      headline = Enum.find(region.changes, &(&1.field == :headline))
+      assert headline.changed
+      assert headline.old =~ "暴雨红色预警"
+      assert headline.new == "变更后标题"
     end
   end
 
   describe "CAP XML export/import through the context" do
-    test "export then import round-trips the structured fields" do
+    test "export then import round-trips the structured fields and infos" do
       {_alert, version} = create_alert!()
       xml = CapAlert.export_cap(version)
       assert is_binary(xml)
+      assert xml =~ "<info>"
 
       assert {:ok, %{alert: alert, version: imported}} =
                CapAlert.import_cap(xml, "importer")
 
-      assert alert.identifier == "CN-20260729-GD-RAIN-001"
-      assert imported.event == "暴雨"
-      assert imported.severity == :severe
+      assert alert.identifier == @identifier
+      assert length(imported.infos) == 1
       assert imported.status == :actual
-      assert Enum.map(imported.geocodes, & &1.value) |> Enum.sort() == ["440800", "440900"]
+      info = hd(imported.infos)
+      assert info.event == "暴雨"
+      assert info.severity == :severe
+      assert Enum.map(info.geocodes, & &1.value) |> Enum.sort() == ["440800", "440900"]
+    end
+
+    test "multi-info round-trip preserves info-to-area correspondence" do
+      {:ok, %{version: version}} =
+        CapAlert.create_alert(
+          multi_info_attrs("CN-ROUNDTRIP-001"),
+          "t"
+        )
+
+      xml = CapAlert.export_cap(version)
+      assert {:ok, %{version: imported}} = CapAlert.import_cap(xml, "importer")
+
+      assert length(imported.infos) == 2
+
+      first = Enum.at(imported.infos, 0)
+      second = Enum.at(imported.infos, 1)
+
+      assert Enum.map(first.geocodes, & &1.value) == ["440800"]
+      assert first.severity == :severe
+      assert Enum.map(second.geocodes, & &1.value) == ["440900"]
+      assert second.severity == :extreme
     end
 
     test "import rejects external entity documents" do
@@ -372,5 +637,47 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
 
       assert {:error, :doctype_or_entity_forbidden} = CapAlert.import_cap(xml, "importer")
     end
+  end
+
+  defp infos_param(infos) do
+    infos
+    |> Enum.with_index()
+    |> Map.new(fn {info, idx} ->
+      {Integer.to_string(idx),
+       %{
+         "event" => info.event,
+         "headline" => info.headline,
+         "severity" => info.severity && Atom.to_string(info.severity),
+         "geocodes" =>
+           info.geocodes
+           |> Enum.with_index()
+           |> Map.new(fn {gc, i} ->
+             {Integer.to_string(i), %{"value_name" => gc.value_name, "value" => gc.value}}
+           end)
+       }}
+    end)
+  end
+
+  defp multi_info_attrs(id) do
+    %{
+      "identifier" => id,
+      "sender" => "s@example.com",
+      "sent" => ~U[2026-07-29 08:00:00Z],
+      "status" => "actual",
+      "msg_type" => "alert",
+      "scope" => "public",
+      "infos" => %{
+        "0" => %{
+          "event" => "暴雨",
+          "severity" => "severe",
+          "geocodes" => %{"0" => %{"value_name" => "Same", "value" => "440800"}}
+        },
+        "1" => %{
+          "event" => "暴雨",
+          "severity" => "extreme",
+          "geocodes" => %{"0" => %{"value_name" => "Same", "value" => "440900"}}
+        }
+      }
+    }
   end
 end

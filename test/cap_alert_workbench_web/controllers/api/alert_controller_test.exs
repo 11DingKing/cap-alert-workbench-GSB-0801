@@ -12,14 +12,18 @@ defmodule CapAlertWorkbenchWeb.API.AlertControllerTest do
     "status" => "actual",
     "msg_type" => "alert",
     "scope" => "public",
-    "language" => "zh-CN",
-    "event" => "暴雨",
-    "headline" => "API 测试预警",
-    "instruction" => "注意安全",
-    "urgency" => "immediate",
-    "severity" => "severe",
-    "certainty" => "likely",
-    "geocodes" => %{"0" => %{"value_name" => "Same", "value" => "440800"}}
+    "infos" => %{
+      "0" => %{
+        "language" => "zh-CN",
+        "event" => "暴雨",
+        "headline" => "API 测试预警",
+        "instruction" => "注意安全",
+        "urgency" => "immediate",
+        "severity" => "severe",
+        "certainty" => "likely",
+        "geocodes" => %{"0" => %{"value_name" => "Same", "value" => "440800"}}
+      }
+    }
   }
 
   setup do
@@ -34,19 +38,20 @@ defmodule CapAlertWorkbenchWeb.API.AlertControllerTest do
     assert Enum.any?(body["data"], &(&1["identifier"] == @identifier))
   end
 
-  test "GET /api/alerts/:identifier returns detail", %{conn: conn} do
+  test "GET /api/alerts/:identifier returns detail with infos", %{conn: conn} do
     conn = get(conn, ~p"/api/alerts/#{@identifier}")
     body = json_response(conn, 200)
     assert body["data"]["alert"]["identifier"] == @identifier
     assert length(body["data"]["versions"]) == 1
+    latest = body["data"]["latest_version"]
+    assert length(latest["infos"]) == 1
+    assert hd(latest["infos"])["severity"] == "severe"
   end
 
   test "workflow through API: submit -> review -> publish", %{conn: conn, version: version} do
-    # Submit
     conn = post(conn, ~p"/api/alerts/#{@identifier}/versions/#{version.id}/submit")
     assert %{"data" => %{"workflow_state" => "in_review"}} = json_response(conn, 200)
 
-    # Approve
     conn =
       post(conn, ~p"/api/alerts/#{@identifier}/versions/#{version.id}/review", %{
         "decision" => "approve",
@@ -55,7 +60,6 @@ defmodule CapAlertWorkbenchWeb.API.AlertControllerTest do
 
     assert %{"data" => %{"workflow_state" => "approved"}} = json_response(conn, 200)
 
-    # Publish
     conn = post(conn, ~p"/api/alerts/#{@identifier}/versions/#{version.id}/publish")
     body = json_response(conn, 200)
     assert body["data"]["workflow_state"] == "published"
@@ -71,6 +75,24 @@ defmodule CapAlertWorkbenchWeb.API.AlertControllerTest do
     assert xml =~ "CN-API-001"
     assert xml =~ "<status>"
     assert xml =~ "Actual"
+    assert xml =~ "<info>"
+  end
+
+  test "POST /api/alerts/:identifier/c1 creates a C1 correction alert", %{
+    conn: conn,
+    version: version
+  } do
+    {:ok, _} = CapAlert.submit_for_review(version, "api")
+    {:ok, approved} = CapAlert.review(version, :approve, "", "api")
+    {:ok, _published} = CapAlert.publish(approved, "api")
+
+    conn = post(conn, ~p"/api/alerts/#{@identifier}/c1")
+    body = json_response(conn, 201)
+    assert body["data"]["alert"]["identifier"] == "#{@identifier}-C1"
+    c1_version = body["data"]["version"]
+    assert c1_version["msg_type"] == "update"
+    assert length(c1_version["infos"]) == 1
+    assert hd(c1_version["infos"])["severity"] == "severe"
   end
 
   test "POST /api/import rejects XXE documents", %{conn: conn} do

@@ -8,6 +8,9 @@ defmodule CapAlertWorkbench.CapAlert do
   transition goes through `StateMachine` via pattern matching, and every
   publishing step is wrapped in a single database transaction that also writes
   the audit event and the notification outbox row.
+
+  CAP content that varies per region lives in a list of `AlertInfo` embeds on
+  each version, mirroring the CAP 1.2 multi-`<info>` structure.
   """
 
   import Ecto.Query, warn: false
@@ -17,6 +20,7 @@ defmodule CapAlertWorkbench.CapAlert do
 
   alias CapAlertWorkbench.CapAlert.{
     Alert,
+    AlertInfo,
     AlertVersion,
     AuditEvent,
     NotificationOutbox,
@@ -184,7 +188,8 @@ defmodule CapAlertWorkbench.CapAlert do
         "status" => attrs["status"] || attrs[:status] || "draft",
         "msg_type" => attrs["msg_type"] || attrs[:msg_type] || "alert",
         "scope" => attrs["scope"] || attrs[:scope] || "public",
-        "sent" => attrs["sent"] || attrs[:sent] || now()
+        "sent" => attrs["sent"] || attrs[:sent] || now(),
+        "sender" => alert.sender
       })
 
     %AlertVersion{lock_version: 0}
@@ -325,6 +330,7 @@ defmodule CapAlertWorkbench.CapAlert do
                }) do
           updated
         else
+          {:error, :not_latest} -> Repo.rollback(:stale_review)
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
@@ -426,7 +432,7 @@ defmodule CapAlertWorkbench.CapAlert do
   end
 
   # ---------------------------------------------------------------------------
-  # Create correction / cancellation from a published version
+  # Same-alert correction / cancellation (new version within the same alert)
   # ---------------------------------------------------------------------------
 
   @spec create_correction(map(), actor()) :: {:ok, AlertVersion.t()} | {:error, term()}
@@ -469,21 +475,7 @@ defmodule CapAlertWorkbench.CapAlert do
               "references" => references,
               "based_on_version_id" => published.id,
               "sent" => now(),
-              "event" => attrs["event"] || attrs[:event] || published.event,
-              "headline" => attrs["headline"] || attrs[:headline] || published.headline,
-              "description" =>
-                attrs["description"] || attrs[:description] || published.description,
-              "instruction" =>
-                attrs["instruction"] || attrs[:instruction] || published.instruction,
-              "language" => attrs["language"] || attrs[:language] || published.language,
-              "urgency" => to_string(attrs["urgency"] || attrs[:urgency] || published.urgency),
-              "severity" =>
-                to_string(attrs["severity"] || attrs[:severity] || published.severity),
-              "certainty" =>
-                to_string(attrs["certainty"] || attrs[:certainty] || published.certainty),
-              "area_desc" => attrs["area_desc"] || attrs[:area_desc] || published.area_desc,
-              "geocodes" =>
-                attrs["geocodes"] || attrs[:geocodes] || encode_geocodes(published.geocodes)
+              "infos" => infos_to_params(published.infos)
             })
 
           changeset =
@@ -508,6 +500,148 @@ defmodule CapAlertWorkbench.CapAlert do
     broadcast_on_ok(result, :version_created)
   end
 
+  # ---------------------------------------------------------------------------
+  # C1 correction as a NEW alert aggregate
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Create a C1 correction alert derived from the latest published version of
+  `source_identifier`.
+
+  The new alert gets the identifier `"<source>-C1"` (or a custom one), its
+  first version has `msgType=Update` and `references` pointing precisely at the
+  *first-round* published document of the source. Info segments are split by
+  region and the 440900 region is raised to `Extreme`.
+
+  Concurrency: the source alert row is locked `FOR UPDATE`, serializing C1
+  creation; the primary-key unique constraint on the new identifier turns a
+  duplicate attempt into a changeset error rather than a second C1/outbox.
+  """
+  @spec create_correction_alert(map(), actor()) ::
+          {:ok, map()} | {:error, term()}
+  def create_correction_alert(attrs, actor \\ "editor") do
+    attrs = normalize_keys(attrs)
+
+    source_id = attrs["source_identifier"] || attrs[:source_identifier]
+
+    result =
+      Repo.transaction(fn ->
+        source_alert = lock_alert(source_id)
+
+        source_version =
+          if source_alert.published_version_id do
+            lock_version(source_alert.published_version_id)
+          end
+
+        if is_nil(source_version) do
+          Repo.rollback(:no_published_version)
+        else
+          new_identifier =
+            case attrs["identifier"] do
+              id when is_binary(id) and id != "" -> id
+              _ -> "#{source_id}-C1"
+            end
+
+          first_round = first_published_version(source_id) || source_version
+          references = build_references(first_round)
+
+          infos = c1_infos(source_version)
+
+          new_alert_attrs = %{
+            "identifier" => new_identifier,
+            "sender" => source_version.sender,
+            "state" => "active"
+          }
+
+          with {:ok, new_alert} <-
+                 %Alert{} |> Alert.changeset(new_alert_attrs) |> Repo.insert(),
+               number = next_version_number(new_identifier),
+               params = %{
+                 "alert_identifier" => new_identifier,
+                 "version_number" => number,
+                 "workflow_state" => "draft",
+                 "status" => "actual",
+                 "msg_type" => "update",
+                 "scope" => Atom.to_string(source_version.scope),
+                 "sender" => source_version.sender,
+                 "sent" => now(),
+                 "references" => references,
+                 "based_on_version_id" => source_version.id,
+                 "infos" => infos_to_params(infos),
+                 "extensions" => encode_elements(source_version.extensions)
+               },
+               changeset = %AlertVersion{lock_version: 0} |> AlertVersion.changeset(params),
+               {:ok, new_version} <- Repo.insert(changeset),
+               {:ok, _} <-
+                 Alert.changeset(new_alert, %{latest_version_id: new_version.id})
+                 |> Repo.update(),
+               {:ok, _audit} <-
+                 record_audit(new_identifier, new_version.id, actor, "c1_created", %{
+                   "source_identifier" => source_id,
+                   "based_on_version_id" => source_version.id,
+                   "references" => references
+                 }) do
+            %{alert: new_alert, version: new_version}
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        end
+      end)
+
+    case result do
+      {:ok, %{alert: alert} = data} ->
+        broadcast_alert(alert.identifier, {:alert_created, alert})
+        {:ok, data}
+
+      other ->
+        other
+    end
+  end
+
+  @doc """
+  Build the C1 info list from a published version. Info segments that cover
+  multiple geocodes are split into one info per geocode; the segment covering
+  440900 has its severity raised to `:extreme`, while 440800 keeps `:severe`.
+  """
+  @spec c1_infos(AlertVersion.t()) :: [AlertInfo.t()]
+  def c1_infos(%AlertVersion{infos: infos}) do
+    Enum.flat_map(infos, fn info ->
+      case info.geocodes do
+        [_single] ->
+          [maybe_raise_440900(info)]
+
+        gcs when is_list(gcs) and length(gcs) > 1 ->
+          Enum.map(gcs, fn gc ->
+            %{info | geocodes: [gc], area_desc: gc.value}
+            |> maybe_raise_440900()
+          end)
+
+        _ ->
+          [info]
+      end
+    end)
+  end
+
+  defp maybe_raise_440900(%AlertInfo{} = info) do
+    values = Enum.map(info.geocodes, & &1.value)
+
+    if "440900" in values do
+      %{info | severity: :extreme}
+    else
+      info
+    end
+  end
+
+  @doc "Return the earliest ever-published version of an alert (the first-round document)."
+  def first_published_version(alert_identifier) do
+    AlertVersion
+    |> where(alert_identifier: ^alert_identifier)
+    |> where([v], v.workflow_state in [:published, :superseded, :cancelled])
+    |> order_by(asc: :version_number)
+    |> limit(1)
+    |> Repo.one()
+  end
+
   defp build_references(%AlertVersion{} = published) do
     sent =
       case published.sent do
@@ -530,7 +664,7 @@ defmodule CapAlertWorkbench.CapAlert do
     with {:ok, fields, _element} <- CapXml.decode(xml),
          {:ok, identifier} <- fetch_identifier(fields),
          attrs <- cap_fields_to_attrs(fields),
-         {:ok, result} <- upsert_from_import(identifier, attrs, fields, actor) do
+         {:ok, result} <- upsert_from_import(identifier, attrs, actor) do
       {:ok, result}
     end
   end
@@ -538,14 +672,12 @@ defmodule CapAlertWorkbench.CapAlert do
   defp fetch_identifier(%{identifier: id}) when is_binary(id) and id != "", do: {:ok, id}
   defp fetch_identifier(_), do: {:error, :missing_identifier}
 
-  defp upsert_from_import(identifier, attrs, fields, actor) do
+  defp upsert_from_import(identifier, attrs, actor) do
     case get_alert(identifier) do
       nil ->
         create_alert(Map.put(attrs, "identifier", identifier), actor)
 
       %Alert{} = alert ->
-        # Importing an existing alert creates a new draft version based on the
-        # latest version (or published version) with the imported content.
         base = latest_version(alert) || published_version(alert)
         number = next_version_number(identifier)
 
@@ -555,8 +687,7 @@ defmodule CapAlertWorkbench.CapAlert do
             "alert_identifier" => identifier,
             "version_number" => number,
             "workflow_state" => "draft",
-            "based_on_version_id" => base && base.id,
-            "extensions" => extensions_to_json(fields)
+            "based_on_version_id" => base && base.id
           })
 
         result =
@@ -683,8 +814,7 @@ defmodule CapAlertWorkbench.CapAlert do
     number = next_version_number(alert.identifier)
 
     params =
-      version
-      |> version_to_attrs()
+      version_to_attrs(version)
       |> Map.drop(["id", "inserted_at", "updated_at", "published_at", "reviewed_at"])
       |> Map.merge(%{
         "alert_identifier" => alert.identifier,
@@ -769,10 +899,16 @@ defmodule CapAlertWorkbench.CapAlert do
         "version_id" => version.id,
         "version_number" => version.version_number,
         "msg_type" => Atom.to_string(version.msg_type),
-        "event" => version.event,
-        "headline" => version.headline,
-        "severity" => version.severity && Atom.to_string(version.severity),
-        "urgency" => version.urgency && Atom.to_string(version.urgency),
+        "infos" =>
+          Enum.map(version.infos, fn info ->
+            %{
+              "event" => info.event,
+              "headline" => info.headline,
+              "severity" => info.severity && Atom.to_string(info.severity),
+              "urgency" => info.urgency && Atom.to_string(info.urgency),
+              "areas" => Enum.map(info.geocodes, & &1.value)
+            }
+          end),
         "published_at" => DateTime.to_iso8601(version.published_at)
       },
       status: :pending
@@ -797,7 +933,7 @@ defmodule CapAlertWorkbench.CapAlert do
   defp version_params(%{} = attrs) do
     attrs
     |> normalize_keys()
-    |> normalize_geocodes()
+    |> normalize_infos()
     |> normalize_extensions()
   end
 
@@ -810,18 +946,15 @@ defmodule CapAlertWorkbench.CapAlert do
 
   defp now, do: DateTime.truncate(DateTime.utc_now(), :second)
 
-  defp normalize_geocodes(%{"geocodes" => list} = params) when is_list(list) do
-    encoded =
-      Enum.map(list, fn
-        %{value_name: _, value: _} = gc -> Map.new(gc, fn {k, v} -> {to_string(k), v} end)
-        gc when is_map(gc) -> gc
-        {name, value} -> %{"value_name" => name, "value" => value}
-      end)
-
-    Map.put(params, "geocodes", encoded)
+  defp normalize_infos(%{"infos" => infos} = params) when is_map(infos) do
+    Map.put(params, "infos", infos)
   end
 
-  defp normalize_geocodes(params), do: params
+  defp normalize_infos(%{"infos" => infos} = params) when is_list(infos) do
+    Map.put(params, "infos", infos)
+  end
+
+  defp normalize_infos(params), do: params
 
   defp normalize_extensions(%{"extensions" => list} = params) when is_list(list) do
     Map.put(
@@ -836,8 +969,28 @@ defmodule CapAlertWorkbench.CapAlert do
 
   defp normalize_extensions(params), do: params
 
-  defp encode_geocodes(geocodes) when is_list(geocodes) do
-    Enum.map(geocodes, fn gc -> %{"value_name" => gc.value_name, "value" => gc.value} end)
+  defp encode_elements(nil), do: []
+  defp encode_elements(list) when is_list(list), do: list
+
+  defp infos_to_params(infos) when is_list(infos) do
+    Enum.map(infos, fn info ->
+      info
+      |> Map.from_struct()
+      |> Map.drop([:__meta__])
+      |> Map.new(fn
+        {k, %DateTime{} = dt} -> {Atom.to_string(k), dt}
+        {k, v} when is_atom(v) and not is_nil(v) -> {Atom.to_string(k), Atom.to_string(v)}
+        {k, v} -> {Atom.to_string(k), v}
+      end)
+      |> Map.put("geocodes", geocodes_to_params(info.geocodes))
+      |> Map.put("extensions", info.extensions || [])
+    end)
+  end
+
+  defp geocodes_to_params(geocodes) when is_list(geocodes) do
+    Enum.map(geocodes, fn gc ->
+      %{"value_name" => gc.value_name, "value" => gc.value}
+    end)
   end
 
   defp version_to_cap_fields(%AlertVersion{} = v) do
@@ -849,19 +1002,32 @@ defmodule CapAlertWorkbench.CapAlert do
       msg_type: v.msg_type,
       scope: v.scope,
       references: v.references,
-      language: v.language,
-      event: v.event,
-      headline: v.headline,
-      description: v.description,
-      instruction: v.instruction,
-      urgency: v.urgency,
-      severity: v.severity,
-      certainty: v.certainty,
-      area_desc: v.area_desc,
-      geocodes: Enum.map(v.geocodes, fn gc -> %{value_name: gc.value_name, value: gc.value} end),
-      alert_extensions: json_to_extensions(v.extensions, "alert"),
-      info_extensions: json_to_extensions(v.extensions, "info")
+      infos: Enum.map(v.infos, &info_to_cap_fields/1),
+      alert_extensions: elements_from_json(v.extensions)
     }
+  end
+
+  defp info_to_cap_fields(%AlertInfo{} = info) do
+    %{
+      language: info.language,
+      event: info.event,
+      urgency: info.urgency,
+      severity: info.severity,
+      certainty: info.certainty,
+      headline: info.headline,
+      description: info.description,
+      instruction: info.instruction,
+      area_desc: info.area_desc,
+      geocodes:
+        Enum.map(info.geocodes, fn gc -> %{value_name: gc.value_name, value: gc.value} end),
+      info_extensions: elements_from_json(info.extensions)
+    }
+  end
+
+  defp elements_from_json(nil), do: []
+
+  defp elements_from_json(list) when is_list(list) do
+    Enum.map(list, &CapXml.element_from_map/1)
   end
 
   defp version_to_attrs(%AlertVersion{} = v) do
@@ -873,29 +1039,7 @@ defmodule CapAlertWorkbench.CapAlert do
       {k, v} when is_atom(v) and not is_nil(v) -> {Atom.to_string(k), Atom.to_string(v)}
       {k, v} -> {Atom.to_string(k), v}
     end)
-    |> Map.put("geocodes", encode_geocodes(v.geocodes))
-  end
-
-  defp extensions_to_json(fields) do
-    alert_ext = fields[:alert_extensions] || []
-    info_ext = fields[:info_extensions] || []
-
-    [
-      %{"scope" => "alert", "element" => Enum.map(alert_ext, &CapXml.element_to_map/1)},
-      %{"scope" => "info", "element" => Enum.map(info_ext, &CapXml.element_to_map/1)}
-    ]
-  end
-
-  defp json_to_extensions(nil, _scope), do: []
-
-  defp json_to_extensions(list, scope) when is_list(list) do
-    case Enum.find(list, fn item -> item["scope"] == scope end) do
-      %{"element" => elements} when is_list(elements) ->
-        Enum.map(elements, &CapXml.element_from_map/1)
-
-      _ ->
-        []
-    end
+    |> Map.put("infos", infos_to_params(v.infos))
   end
 
   defp cap_fields_to_attrs(fields) do
@@ -905,19 +1049,27 @@ defmodule CapAlertWorkbench.CapAlert do
       "status" => fields[:status] && Atom.to_string(fields[:status]),
       "msg_type" => fields[:msg_type] && Atom.to_string(fields[:msg_type]),
       "scope" => fields[:scope] && Atom.to_string(fields[:scope]),
-      "language" => fields[:language],
-      "event" => fields[:event],
-      "headline" => fields[:headline],
-      "description" => fields[:description],
-      "instruction" => fields[:instruction],
-      "urgency" => fields[:urgency] && Atom.to_string(fields[:urgency]),
-      "severity" => fields[:severity] && Atom.to_string(fields[:severity]),
-      "certainty" => fields[:certainty] && Atom.to_string(fields[:certainty]),
-      "area_desc" => fields[:area_desc],
+      "infos" => Enum.map(fields[:infos] || [], &info_fields_to_attrs/1),
+      "extensions" => Enum.map(fields[:alert_extensions] || [], &CapXml.element_to_map/1)
+    }
+  end
+
+  defp info_fields_to_attrs(info) do
+    %{
+      "language" => info[:language],
+      "event" => info[:event],
+      "urgency" => info[:urgency] && Atom.to_string(info[:urgency]),
+      "severity" => info[:severity] && Atom.to_string(info[:severity]),
+      "certainty" => info[:certainty] && Atom.to_string(info[:certainty]),
+      "headline" => info[:headline],
+      "description" => info[:description],
+      "instruction" => info[:instruction],
+      "area_desc" => info[:area_desc],
       "geocodes" =>
-        Enum.map(fields[:geocodes] || [], fn gc ->
+        Enum.map(info[:geocodes] || [], fn gc ->
           %{"value_name" => gc[:value_name], "value" => gc[:value]}
-        end)
+        end),
+      "extensions" => Enum.map(info[:info_extensions] || [], &CapXml.element_to_map/1)
     }
   end
 
@@ -930,6 +1082,6 @@ defmodule CapAlertWorkbench.CapAlert do
 
   defp parse_sent(other), do: other
 
-  # Re-export enum helpers for the web layer
+  @doc "Expose the enums module for the web layer."
   def enums, do: Enums
 end

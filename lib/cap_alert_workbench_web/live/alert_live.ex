@@ -2,7 +2,7 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
   use CapAlertWorkbenchWeb, :live_view
 
   alias CapAlertWorkbench.CapAlert
-  alias CapAlertWorkbench.CapAlert.{Enums, AlertVersion, StateMachine}
+  alias CapAlertWorkbench.CapAlert.{AlertVersion, Enums, StateMachine}
   alias CapAlertWorkbenchWeb.CapAlertUI
 
   @impl true
@@ -137,9 +137,44 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
     {:noreply, assign(socket, :form, to_form(changeset))}
   end
 
-  def handle_event("add_geocode", _, socket) do
-    params = socket.assigns.form.params
-    geocodes = params["geocodes"] || %{}
+  def handle_event("add_info", _params, socket) do
+    params = ensure_infos_params(socket)
+    infos = params["infos"]
+
+    next_index =
+      infos |> Map.keys() |> Enum.map(&String.to_integer/1) |> Enum.max(fn -> -1 end)
+
+    new_info = %{
+      "language" => "zh-CN",
+      "event" => "",
+      "headline" => "",
+      "description" => "",
+      "instruction" => "",
+      "urgency" => "immediate",
+      "severity" => "severe",
+      "certainty" => "likely",
+      "area_desc" => "",
+      "geocodes" => %{"0" => %{"value_name" => "Same", "value" => ""}}
+    }
+
+    infos = Map.put(infos, Integer.to_string(next_index + 1), new_info)
+    params = Map.put(params, "infos", infos)
+
+    {:noreply, rebuild_form(socket, params)}
+  end
+
+  def handle_event("remove_info", %{"index" => index}, socket) do
+    params = ensure_infos_params(socket)
+    infos = Map.delete(params["infos"], index)
+    params = Map.put(params, "infos", infos)
+    {:noreply, rebuild_form(socket, params)}
+  end
+
+  def handle_event("add_geocode", %{"info-index" => info_index}, socket) do
+    params = ensure_infos_params(socket)
+    infos = params["infos"]
+    info = infos[info_index] || %{}
+    geocodes = info["geocodes"] || %{}
 
     next_index =
       geocodes |> Map.keys() |> Enum.map(&String.to_integer/1) |> Enum.max(fn -> -1 end)
@@ -150,23 +185,19 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
         "value" => ""
       })
 
-    params = Map.put(params, "geocodes", geocodes)
-
-    changeset =
-      AlertVersion.changeset(socket.assigns.latest, params) |> Map.put(:action, :validate)
-
-    {:noreply, assign(socket, :form, to_form(changeset))}
+    infos = Map.put(infos, info_index, Map.put(info, "geocodes", geocodes))
+    params = Map.put(params, "infos", infos)
+    {:noreply, rebuild_form(socket, params)}
   end
 
-  def handle_event("remove_geocode", %{"index" => index}, socket) do
-    params = socket.assigns.form.params
-    geocodes = Map.delete(params["geocodes"] || %{}, index)
-    params = Map.put(params, "geocodes", geocodes)
-
-    changeset =
-      AlertVersion.changeset(socket.assigns.latest, params) |> Map.put(:action, :validate)
-
-    {:noreply, assign(socket, :form, to_form(changeset))}
+  def handle_event("remove_geocode", %{"info-index" => info_index, "index" => index}, socket) do
+    params = ensure_infos_params(socket)
+    infos = params["infos"]
+    info = infos[info_index] || %{}
+    geocodes = Map.delete(info["geocodes"] || %{}, index)
+    infos = Map.put(infos, info_index, Map.put(info, "geocodes", geocodes))
+    params = Map.put(params, "infos", infos)
+    {:noreply, rebuild_form(socket, params)}
   end
 
   def handle_event("save", %{"alert_version" => params}, socket) do
@@ -242,13 +273,48 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
     )
   end
 
+  def handle_event("create_c1", _, socket) do
+    attrs = %{"source_identifier" => socket.assigns.identifier}
+
+    case CapAlert.create_correction_alert(attrs, socket.assigns.actor) do
+      {:ok, %{alert: alert}} ->
+        {:noreply,
+         socket
+         |> put_flash(:info, "已创建更正 C1（440900→Extreme），请编辑后提交复核")
+         |> push_navigate(to: ~p"/alerts/#{alert.identifier}")}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:noreply,
+         socket
+         |> put_flash(:error, format_changeset_errors(changeset))
+         |> reload_data_preserving_form()}
+
+      {:error, reason} ->
+        {:noreply, put_flash(socket, :error, error_message(reason))}
+    end
+  end
+
   def handle_event("create_cancellation", _, socket) do
+    [first_info | _] = socket.assigns.latest.infos
+
     attrs = %{
       "alert_identifier" => socket.assigns.identifier,
-      "event" => socket.assigns[:latest] && socket.assigns.latest.event,
-      "headline" => "预警解除",
-      "description" => "该预警已解除。",
-      "instruction" => "本次预警事件已结束。"
+      "infos" => %{
+        "0" => %{
+          "event" => first_info.event,
+          "headline" => "预警解除",
+          "description" => "该预警已解除。",
+          "instruction" => "本次预警事件已结束。",
+          "severity" => first_info.severity && Atom.to_string(first_info.severity),
+          "urgency" => first_info.urgency && Atom.to_string(first_info.urgency),
+          "certainty" => first_info.certainty && Atom.to_string(first_info.certainty),
+          "geocodes" =>
+            Enum.with_index(first_info.geocodes)
+            |> Map.new(fn {gc, i} ->
+              {Integer.to_string(i), %{"value_name" => gc.value_name, "value" => gc.value}}
+            end)
+        }
+      }
     }
 
     handle_command(
@@ -260,6 +326,53 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
 
   def handle_event("toggle_xml", _, socket) do
     {:noreply, assign(socket, :xml_preview, not socket.assigns.xml_preview)}
+  end
+
+  defp ensure_infos_params(socket) do
+    params = socket.assigns.form.params
+
+    if params["infos"] do
+      params
+    else
+      Map.put(params, "infos", infos_to_form_params(socket.assigns.latest.infos))
+    end
+  end
+
+  defp infos_to_form_params(infos) do
+    infos
+    |> Enum.with_index()
+    |> Map.new(fn {info, idx} ->
+      geocodes =
+        info.geocodes
+        |> Enum.with_index()
+        |> Map.new(fn {gc, gidx} ->
+          {Integer.to_string(gidx),
+           %{"value_name" => gc.value_name || "Same", "value" => gc.value || ""}}
+        end)
+
+      {Integer.to_string(idx),
+       %{
+         "language" => info.language || "zh-CN",
+         "event" => info.event || "",
+         "headline" => info.headline || "",
+         "description" => info.description || "",
+         "instruction" => info.instruction || "",
+         "urgency" => info.urgency && Atom.to_string(info.urgency),
+         "severity" => info.severity && Atom.to_string(info.severity),
+         "certainty" => info.certainty && Atom.to_string(info.certainty),
+         "area_desc" => info.area_desc || "",
+         "geocodes" => geocodes
+       }}
+    end)
+  end
+
+  defp rebuild_form(socket, params) do
+    changeset =
+      socket.assigns.latest
+      |> AlertVersion.changeset(params)
+      |> Map.put(:action, :validate)
+
+    assign(socket, :form, to_form(changeset))
   end
 
   defp handle_command(socket, fun, success_msg) do
@@ -356,7 +469,7 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
             xml_preview={@xml_preview}
           />
 
-          <.actions_section latest={@latest} published={@published} />
+          <.actions_section latest={@latest} published={@published} identifier={@identifier} />
         </div>
 
         <div class="space-y-6">
@@ -383,10 +496,13 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
               {@data.alert.identifier}
             </h1>
             {state_badge(@latest && @latest.workflow_state)}
-            {severity_badge(@latest && @latest.severity)}
+            {severity_badge(CapAlertUI.highest_severity(@latest && @latest.infos))}
           </div>
           <p class="mt-1 text-sm text-slate-500">
             {@data.alert.sender} · 发送于 {CapAlertUI.format_sent(@latest && @latest.sent)}
+          </p>
+          <p :if={@latest} class="mt-1 text-xs text-slate-400">
+            {CapAlertUI.infos_summary(@latest.infos)}
           </p>
         </div>
         <div class="text-right text-xs text-slate-400">
@@ -415,20 +531,8 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
         <.input field={@form[:lock_version]} type="hidden" />
 
         <div class="grid gap-4 sm:grid-cols-2">
-          <.input field={@form[:event]} label="事件 event" required />
-          <.input field={@form[:headline]} label="标题 headline" />
           <.input field={@form[:sender]} label="发送方 sender" required />
           <.input field={@form[:sent]} type="datetime-local" label="发送时间 sent" required />
-          <.input field={@form[:language]} label="语言 language" />
-          <.input
-            field={@form[:scope]}
-            type="select"
-            label="范围 scope"
-            options={select_opts(Enums.cap_scopes(), &Enums.cap_scope_string/1)}
-          />
-        </div>
-
-        <div class="grid gap-4 sm:grid-cols-3">
           <.input
             field={@form[:status]}
             type="select"
@@ -442,52 +546,107 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
             options={select_opts(Enums.cap_msg_types(), &Enums.cap_msg_type_string/1)}
           />
           <.input
-            field={@form[:urgency]}
+            field={@form[:scope]}
             type="select"
-            label="紧急度 urgency"
-            options={select_opts(Enums.cap_urgencies(), &Enums.cap_urgency_string/1)}
-          />
-          <.input
-            field={@form[:severity]}
-            type="select"
-            label="严重度 severity"
-            options={select_opts(Enums.cap_severities(), &Enums.cap_severity_string/1)}
-          />
-          <.input
-            field={@form[:certainty]}
-            type="select"
-            label="确定性 certainty"
-            options={select_opts(Enums.cap_certainties(), &Enums.cap_certainty_string/1)}
+            label="范围 scope"
+            options={select_opts(Enums.cap_scopes(), &Enums.cap_scope_string/1)}
           />
         </div>
 
-        <.input field={@form[:description]} type="textarea" label="描述 description" rows="3" />
-        <.input field={@form[:instruction]} type="textarea" label="处置建议 instruction" rows="4" />
-        <.input field={@form[:area_desc]} label="区域描述 areaDesc" />
+        <div class="flex items-center justify-between border-t border-slate-100 pt-4">
+          <h3 class="text-sm font-semibold text-slate-900">Info 段（按地区/语言）</h3>
+          <button type="button" phx-click="add_info" class="btn btn-ghost btn-sm">
+            <.icon name="hero-plus" class="size-4" /> 添加 Info
+          </button>
+        </div>
 
-        <div>
-          <div class="mb-2 flex items-center justify-between">
-            <span class="text-sm font-medium text-slate-700">区域编码 geocodes</span>
-            <button type="button" phx-click="add_geocode" class="btn btn-ghost btn-xs">
-              <.icon name="hero-plus" class="size-4" /> 添加
-            </button>
-          </div>
-          <div class="space-y-2">
-            <.inputs_for :let={g} field={@form[:geocodes]}>
-              <div class="flex gap-2">
-                <.input field={g[:value_name]} class="w-32" placeholder="valueName" />
-                <.input field={g[:value]} class="flex-1" placeholder="区域编码" />
+        <div class="space-y-4">
+          <.inputs_for :let={info_f} field={@form[:infos]}>
+            <div class="rounded-lg border border-slate-200 bg-slate-50/60 p-4">
+              <div class="mb-3 flex items-center justify-between">
+                <span class="text-xs font-medium uppercase tracking-wide text-slate-500">
+                  Info #{info_f.index}
+                </span>
                 <button
                   type="button"
-                  phx-click="remove_geocode"
-                  phx-value-index={g.index}
-                  class="btn btn-ghost btn-sm text-red-600 self-end"
+                  phx-click="remove_info"
+                  phx-value-index={info_f.index}
+                  class="btn btn-ghost btn-xs text-red-600"
                 >
-                  <.icon name="hero-trash" class="size-4" />
+                  <.icon name="hero-trash" class="size-4" /> 删除
                 </button>
               </div>
-            </.inputs_for>
-          </div>
+
+              <div class="grid gap-3 sm:grid-cols-2">
+                <.input field={info_f[:event]} label="事件 event" required />
+                <.input field={info_f[:headline]} label="标题 headline" />
+                <.input field={info_f[:language]} label="语言 language" />
+                <.input field={info_f[:area_desc]} label="区域描述 areaDesc" />
+                <.input
+                  field={info_f[:urgency]}
+                  type="select"
+                  label="紧急度 urgency"
+                  options={select_opts(Enums.cap_urgencies(), &Enums.cap_urgency_string/1)}
+                />
+                <.input
+                  field={info_f[:severity]}
+                  type="select"
+                  label="严重度 severity"
+                  options={select_opts(Enums.cap_severities(), &Enums.cap_severity_string/1)}
+                />
+                <.input
+                  field={info_f[:certainty]}
+                  type="select"
+                  label="确定性 certainty"
+                  options={select_opts(Enums.cap_certainties(), &Enums.cap_certainty_string/1)}
+                />
+              </div>
+
+              <.input
+                field={info_f[:description]}
+                type="textarea"
+                label="描述 description"
+                rows="2"
+              />
+              <.input
+                field={info_f[:instruction]}
+                type="textarea"
+                label="处置建议 instruction"
+                rows="2"
+              />
+
+              <div class="mt-3">
+                <div class="mb-2 flex items-center justify-between">
+                  <span class="text-xs font-medium text-slate-600">区域编码 geocodes</span>
+                  <button
+                    type="button"
+                    phx-click="add_geocode"
+                    phx-value-info-index={info_f.index}
+                    class="btn btn-ghost btn-xs"
+                  >
+                    <.icon name="hero-plus" class="size-4" /> 添加区域
+                  </button>
+                </div>
+                <div class="space-y-2">
+                  <.inputs_for :let={g} field={info_f[:geocodes]}>
+                    <div class="flex gap-2">
+                      <.input field={g[:value_name]} class="w-32" placeholder="valueName" />
+                      <.input field={g[:value]} class="flex-1" placeholder="区域编码" />
+                      <button
+                        type="button"
+                        phx-click="remove_geocode"
+                        phx-value-info-index={info_f.index}
+                        phx-value-index={g.index}
+                        class="btn btn-ghost btn-sm text-red-600 self-end"
+                      >
+                        <.icon name="hero-trash" class="size-4" />
+                      </button>
+                    </div>
+                  </.inputs_for>
+                </div>
+              </div>
+            </div>
+          </.inputs_for>
         </div>
 
         <div class="flex items-center justify-between border-t border-slate-100 pt-4">
@@ -515,9 +674,7 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
   defp readonly_section(assigns) do
     ~H"""
     <section class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
-      <div class="grid gap-4 sm:grid-cols-2">
-        <.readonly_field label="事件" value={@latest.event} />
-        <.readonly_field label="标题" value={@latest.headline} />
+      <div class="grid gap-4 sm:grid-cols-2 text-sm">
         <.readonly_field label="发送方" value={@latest.sender} />
         <.readonly_field label="发送时间" value={CapAlertUI.format_sent(@latest.sent)} />
         <.readonly_field
@@ -525,32 +682,53 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
           value={"#{Enums.cap_status_string(@latest.status)} / #{Enums.cap_msg_type_string(@latest.msg_type)}"}
         />
         <.readonly_field
-          label="范围/语言"
-          value={"#{Enums.cap_scope_string(@latest.scope)} / #{@latest.language}"}
+          label="范围"
+          value={Enums.cap_scope_string(@latest.scope)}
         />
-        <.readonly_field
-          label="紧急度/严重度/确定性"
-          value={"#{Enums.cap_urgency_string(@latest.urgency)} / #{Enums.cap_severity_string(@latest.severity)} / #{Enums.cap_certainty_string(@latest.certainty)}"}
-        />
-        <.readonly_field label="区域编码" value={CapAlertUI.geocodes_summary(@latest.geocodes)} />
       </div>
-      <div class="mt-4 space-y-3 text-sm">
-        <div>
-          <p class="mb-1 font-medium text-slate-700">描述</p>
-          <p class="whitespace-pre-wrap text-slate-600">{@latest.description || "—"}</p>
+
+      <div class="mt-4 space-y-3">
+        <div
+          :for={{info, idx} <- Enum.with_index(@latest.infos)}
+          class="rounded-lg border border-slate-200 bg-slate-50/60 p-3"
+        >
+          <div class="mb-2 flex flex-wrap items-center gap-2">
+            <span class="text-xs font-semibold uppercase text-slate-500">Info #{idx}</span>
+            {severity_badge(info.severity)}
+            <span class="text-xs text-slate-400">{CapAlertUI.geocodes_summary(info.geocodes)}</span>
+          </div>
+          <div class="grid gap-2 sm:grid-cols-2 text-sm">
+            <.readonly_field label="事件" value={info.event} />
+            <.readonly_field label="标题" value={info.headline} />
+            <.readonly_field
+              label="紧急度"
+              value={info.urgency && Enums.cap_urgency_string(info.urgency)}
+            />
+            <.readonly_field
+              label="确定性"
+              value={info.certainty && Enums.cap_certainty_string(info.certainty)}
+            />
+            <.readonly_field label="区域描述" value={info.area_desc} />
+            <.readonly_field label="语言" value={info.language} />
+          </div>
+          <div class="mt-2 text-sm">
+            <p class="text-xs uppercase tracking-wide text-slate-400">描述</p>
+            <p class="whitespace-pre-wrap text-slate-600">{info.description || "—"}</p>
+          </div>
+          <div class="mt-1 text-sm">
+            <p class="text-xs uppercase tracking-wide text-slate-400">处置建议</p>
+            <p class="whitespace-pre-wrap text-slate-600">{info.instruction || "—"}</p>
+          </div>
         </div>
-        <div>
-          <p class="mb-1 font-medium text-slate-700">处置建议</p>
-          <p class="whitespace-pre-wrap text-slate-600">{@latest.instruction || "—"}</p>
-        </div>
-        <div :if={@latest.references}>
-          <p class="mb-1 font-medium text-slate-700">引用 references</p>
-          <p class="break-all font-mono text-xs text-slate-500">{@latest.references}</p>
-        </div>
-        <div :if={@latest.review_comment}>
-          <p class="mb-1 font-medium text-slate-700">复核意见</p>
-          <p class="text-slate-600">{@latest.review_comment} — {@latest.reviewed_by}</p>
-        </div>
+      </div>
+
+      <div :if={@latest.references} class="mt-3">
+        <p class="mb-1 text-xs font-medium uppercase text-slate-400">引用 references</p>
+        <p class="break-all font-mono text-xs text-slate-500">{@latest.references}</p>
+      </div>
+      <div :if={@latest.review_comment} class="mt-3">
+        <p class="mb-1 text-xs font-medium uppercase text-slate-400">复核意见</p>
+        <p class="text-sm text-slate-600">{@latest.review_comment} — {@latest.reviewed_by}</p>
       </div>
 
       <div class="mt-4 flex items-center justify-between border-t border-slate-100 pt-4">
@@ -567,6 +745,7 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
 
   attr :latest, :any
   attr :published, :any
+  attr :identifier, :string
 
   defp actions_section(assigns) do
     ~H"""
@@ -623,10 +802,22 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
               @latest.workflow_state in [:published, :superseded, :cancelled]
           }
           type="button"
-          phx-click="create_correction"
+          phx-click="create_c1"
           class="btn btn-warning btn-sm bg-amber-500 text-white hover:bg-amber-600"
         >
-          <.icon name="hero-pencil" class="size-4" /> 创建更正 (Update)
+          <.icon name="hero-pencil" class="size-4" /> 创建更正 C1（440900→Extreme）
+        </button>
+
+        <button
+          :if={
+            @published && @published.workflow_state == :published &&
+              @latest.workflow_state in [:published, :superseded, :cancelled]
+          }
+          type="button"
+          phx-click="create_correction"
+          class="btn btn-ghost btn-sm"
+        >
+          <.icon name="hero-pencil-square" class="size-4" /> 同标识更正 (Update)
         </button>
 
         <button
