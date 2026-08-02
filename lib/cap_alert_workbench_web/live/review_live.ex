@@ -76,6 +76,7 @@ defmodule CapAlertWorkbenchWeb.ReviewLive do
 
   defp review_error(:stale_review), do: "该版本已不是最新草稿，复核结论已过期（存在更新的草稿）"
   defp review_error(:not_latest), do: "该版本已不是最新版本，无法复核"
+  defp review_error(:not_latest_version), do: "您复核的版本已过期（状态已变更），请刷新后重试"
   defp review_error(reason), do: "复核失败：#{inspect(reason)}"
 
   @impl true

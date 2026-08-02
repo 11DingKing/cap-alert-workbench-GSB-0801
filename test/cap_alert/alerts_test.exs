@@ -680,4 +680,146 @@ defmodule CapAlertWorkbench.CapAlert.AlertsTest do
       }
     }
   end
+
+  describe "external import with concurrent stale draft" do
+    @ext_identifier "CN-20260729-GD-RAIN-EXT-02"
+
+    @ext_xml ~s"""
+    <?xml version="1.0" encoding="UTF-8"?>
+    <alert xmlns="urn:oasis:names:tc:emergency:cap:1.2">
+      <identifier>CN-20260729-GD-RAIN-EXT-02</identifier>
+      <sender>external-feed@gd.example</sender>
+      <sent>2026-07-29T09:30:00+00:00</sent>
+      <status>Actual</status>
+      <msgType>Alert</msgType>
+      <scope>Public</scope>
+      <info>
+        <language>zh-CN</language>
+        <event>暴雨 &amp; 强对流</event>
+        <urgency>Immediate</urgency>
+        <severity>Severe</severity>
+        <certainty>Likely</certainty>
+        <headline>暴雨“红色”预警 &lt;升级&gt;</headline>
+        <description>湛江降雨 &amp; 雷暴 &lt;持续&gt;</description>
+        <ext:note xmlns:ext="urn:example:cap-ext" priority="高">外部备注 &amp; 详情</ext:note>
+        <area>
+          <areaDesc>湛江市</areaDesc>
+          <geocode><valueName>Same</valueName><value>440800</value></geocode>
+        </area>
+      </info>
+      <info>
+        <language>zh-CN</language>
+        <event>暴雨 &amp; 强对流</event>
+        <urgency>Immediate</urgency>
+        <severity>Extreme</severity>
+        <certainty>Observed</certainty>
+        <headline>暴雨“红色”预警 &lt;特别紧急&gt;</headline>
+        <description>茂名降雨 &amp; 冰雹 &lt;加剧&gt;</description>
+        <ext:note xmlns:ext="urn:example:cap-ext" priority="最高">外部备注 &amp; 详情二</ext:note>
+        <area>
+          <areaDesc>茂名市</areaDesc>
+          <geocode><valueName>Same</valueName><value>440900</value></geocode>
+        </area>
+      </info>
+    </alert>
+    """
+
+    setup do
+      # Publish round 1
+      {_alert, v1} = create_alert!()
+      publish_chain!(v1)
+
+      # Create C1 (round 2) draft, capture the stale draft struct before it moves
+      assert {:ok, %{version: c1_draft}} =
+               CapAlert.create_correction_alert(
+                 %{"source_identifier" => @identifier},
+                 "editor"
+               )
+
+      # Drive C1 through submit -> approve -> publish using fresh structs
+      {:ok, submitted} = CapAlert.submit_for_review(c1_draft, "editor")
+      {:ok, approved} = CapAlert.review(submitted, :approve, "ok", "reviewer")
+      {:ok, published_c1} = CapAlert.publish(approved, "publisher")
+
+      %{c1_draft: c1_draft, c1_id: "#{@identifier}-C1", published_c1: published_c1}
+    end
+
+    test "import creates an in_review version and round-trips special chars and extensions", %{
+      c1_id: c1_id
+    } do
+      assert {:ok, %{alert: ext_alert, version: imported}} =
+               CapAlert.import_cap(@ext_xml, "importer")
+
+      assert ext_alert.identifier == @ext_identifier
+      assert imported.workflow_state == :in_review
+      assert length(imported.infos) == 2
+
+      [info_440800, info_440900] = imported.infos
+      assert hd(info_440800.geocodes).value == "440800"
+      assert info_440800.severity == :severe
+      assert hd(info_440900.geocodes).value == "440900"
+      assert info_440900.severity == :extreme
+
+      # Special characters are decoded
+      assert info_440800.headline == ~s(暴雨“红色”预警 <升级>)
+      assert info_440800.description =~ "降雨 & 雷暴 <持续>"
+      assert info_440900.headline == ~s(暴雨“红色”预警 <特别紧急>)
+
+      # Per-info unknown extension nodes are preserved
+      assert length(info_440800.extensions) == 1
+      assert length(info_440900.extensions) == 1
+
+      # Round-trip through export and re-parse
+      xml = CapAlert.export_cap(imported)
+      assert {:ok, %{version: reimported}} = CapAlert.import_cap(xml, "roundtrip")
+
+      # Re-importing an existing alert creates another in_review version
+      assert reimported.workflow_state == :in_review
+      assert reimported.version_number == 2
+      assert length(reimported.infos) == 2
+
+      [ri_1, ri_2] = reimported.infos
+      assert ri_1.severity == :severe
+      assert ri_2.severity == :extreme
+      assert ri_1.headline == ~s(暴雨“红色”预警 <升级>)
+      assert length(ri_1.extensions) == 1
+      assert length(ri_2.extensions) == 1
+
+      ext = hd(ri_2.extensions)
+      assert ext["name"] == "ext:note"
+      assert ext["attrs"]["priority"] == "最高"
+
+      # C1 (round 2) region severities are untouched by the import
+      c1 = CapAlert.get_alert!(c1_id)
+      c1_version = CapAlert.get_version!(c1.latest_version_id)
+      by_region = Map.new(c1_version.infos, fn i -> {hd(i.geocodes).value, i} end)
+      assert by_region["440800"].severity == :severe
+      assert by_region["440900"].severity == :extreme
+    end
+
+    test "submitting a stale pre-publish C1 draft returns not_latest_version", %{
+      c1_draft: stale_draft,
+      c1_id: c1_id,
+      published_c1: published_c1
+    } do
+      # The stale struct still thinks it is a draft; the live row is already published
+      assert stale_draft.workflow_state == :draft
+      assert published_c1.workflow_state == :published
+
+      assert {:error, :not_latest_version} =
+               CapAlert.submit_for_review(stale_draft, "late-browser")
+
+      # No mutation: C1 remains published with its round-2 region severities
+      reloaded = CapAlert.get_version!(published_c1.id)
+      assert reloaded.workflow_state == :published
+
+      by_region = Map.new(reloaded.infos, fn i -> {hd(i.geocodes).value, i} end)
+      assert by_region["440800"].severity == :severe
+      assert by_region["440900"].severity == :extreme
+
+      # No extra versions or outbox rows created for C1 by the rejected submit
+      assert length(CapAlert.list_versions(c1_id)) == 1
+      assert CapAlert.list_outbox(c1_id) |> length() == 1
+    end
+  end
 end

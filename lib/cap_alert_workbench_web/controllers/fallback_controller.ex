@@ -31,6 +31,7 @@ defmodule CapAlertWorkbenchWeb.FallbackController do
   defp error_reason(:stale), do: {409, "版本已被他人更新，请刷新后重试（乐观锁冲突）"}
   defp error_reason(:not_editable), do: {409, "当前状态不可编辑"}
   defp error_reason(:not_latest), do: {409, "该版本已不是最新版本"}
+  defp error_reason(:not_latest_version), do: {409, "您操作的版本已过期（状态已变更），请刷新后重试，不得覆盖已发布的地区级严重度"}
   defp error_reason(:stale_review), do: {409, "复核结论已过期：已存在更新的草稿"}
   defp error_reason(:not_publishable), do: {409, "只有通过复核的最新版本可以发布"}
   defp error_reason(:already_published), do: {409, "该版本已发布，不可重复发布"}

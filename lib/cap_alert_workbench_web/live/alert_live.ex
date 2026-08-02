@@ -398,6 +398,7 @@ defmodule CapAlertWorkbenchWeb.AlertLive do
   defp error_message(:stale), do: "乐观锁冲突：版本已被他人修改"
   defp error_message(:not_editable), do: "当前状态不可编辑"
   defp error_message(:not_latest), do: "该版本已不是最新版本，操作被拒绝"
+  defp error_message(:not_latest_version), do: "您操作的版本已过期（状态已变更），请刷新后重试，不得覆盖已发布的地区级严重度"
   defp error_message(:stale_review), do: "复核结论已过期：已存在更新的草稿，请刷新"
   defp error_message(:not_publishable), do: "只有通过复核的最新版本可以发布"
   defp error_message(:no_published_version), do: "尚未发布过任何版本，无法更正/解除"

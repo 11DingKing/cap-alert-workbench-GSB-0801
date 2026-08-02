@@ -82,8 +82,8 @@ defmodule CapAlertWorkbenchWeb.API.AlertControllerTest do
     conn: conn,
     version: version
   } do
-    {:ok, _} = CapAlert.submit_for_review(version, "api")
-    {:ok, approved} = CapAlert.review(version, :approve, "", "api")
+    {:ok, submitted} = CapAlert.submit_for_review(version, "api")
+    {:ok, approved} = CapAlert.review(submitted, :approve, "", "api")
     {:ok, _published} = CapAlert.publish(approved, "api")
 
     conn = post(conn, ~p"/api/alerts/#{@identifier}/c1")

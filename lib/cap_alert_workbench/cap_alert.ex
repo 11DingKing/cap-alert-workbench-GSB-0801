@@ -141,18 +141,20 @@ defmodule CapAlertWorkbench.CapAlert do
 
   @type actor :: String.t()
 
-  @spec create_alert(map(), actor()) :: {:ok, map()} | {:error, Changeset.t()}
-  def create_alert(attrs, actor \\ "system") do
+  @spec create_alert(map(), actor(), keyword()) :: {:ok, map()} | {:error, Changeset.t()}
+  def create_alert(attrs, actor \\ "system", opts \\ []) do
     attrs = normalize_keys(attrs)
+    workflow_state = Keyword.get(opts, :workflow_state, :draft)
 
     result =
       Repo.transaction(fn ->
         with {:ok, alert} <- do_create_alert(attrs),
-             {:ok, version} <- do_create_first_version(alert, attrs),
+             {:ok, version} <- do_create_first_version(alert, attrs, workflow_state),
              {:ok, alert} <- update_alert_latest(alert, version),
              {:ok, _audit} <-
                record_audit(alert.identifier, version.id, actor, "created", %{
-                 "version_number" => version.version_number
+                 "version_number" => version.version_number,
+                 "workflow_state" => Atom.to_string(workflow_state)
                }) do
           %{alert: alert, version: version}
         else
@@ -176,7 +178,7 @@ defmodule CapAlertWorkbench.CapAlert do
     |> Repo.insert()
   end
 
-  defp do_create_first_version(alert, attrs) do
+  defp do_create_first_version(alert, attrs, workflow_state) do
     number = next_version_number(alert.identifier)
 
     params =
@@ -184,7 +186,7 @@ defmodule CapAlertWorkbench.CapAlert do
       |> Map.merge(%{
         "alert_identifier" => alert.identifier,
         "version_number" => number,
-        "workflow_state" => "draft",
+        "workflow_state" => Atom.to_string(workflow_state),
         "status" => attrs["status"] || attrs[:status] || "draft",
         "msg_type" => attrs["msg_type"] || attrs[:msg_type] || "alert",
         "scope" => attrs["scope"] || attrs[:scope] || "public",
@@ -286,12 +288,15 @@ defmodule CapAlertWorkbench.CapAlert do
   def revise(%AlertVersion{} = version, actor \\ "editor") do
     result =
       Repo.transaction(fn ->
-        alert = Repo.get!(Alert, version.alert_identifier)
+        alert = lock_alert(version.alert_identifier)
+        locked = lock_version(version.id)
 
-        with :ok <- assert_latest(alert, version),
-             {:ok, new_version} <- copy_as_new_draft(alert, version, actor) do
+        with :ok <- assert_state_current(version, locked),
+             :ok <- assert_latest(alert, locked),
+             {:ok, new_version} <- copy_as_new_draft(alert, locked, actor) do
           new_version
         else
+          {:error, :not_latest} -> Repo.rollback(:not_latest_version)
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
@@ -313,7 +318,8 @@ defmodule CapAlertWorkbench.CapAlert do
             :reject -> :reject
           end
 
-        with :ok <- assert_latest(alert, locked),
+        with :ok <- assert_state_current(version, locked),
+             :ok <- assert_latest(alert, locked),
              {:ok, next_state} <- StateMachine.transition(locked.workflow_state, action),
              {:ok, next_state} <- validate_review_guard(locked, alert, next_state),
              changeset <-
@@ -331,6 +337,7 @@ defmodule CapAlertWorkbench.CapAlert do
           updated
         else
           {:error, :not_latest} -> Repo.rollback(:stale_review)
+          {:error, :not_latest_version} -> Repo.rollback(:stale_review)
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
@@ -357,7 +364,8 @@ defmodule CapAlertWorkbench.CapAlert do
         alert = lock_alert(version.alert_identifier)
         locked = lock_version(version.id)
 
-        with :ok <- assert_latest(alert, locked),
+        with :ok <- assert_state_current(version, locked),
+             :ok <- assert_latest(alert, locked),
              :ok <- assert_publishable(locked, alert),
              {:ok, next_state} <- StateMachine.transition(locked.workflow_state, :publish),
              xml_payload <- CapXml.encode(version_to_cap_fields(locked)),
@@ -385,6 +393,7 @@ defmodule CapAlertWorkbench.CapAlert do
              {:ok, _outbox} <- create_outbox(updated_alert, updated) do
           updated
         else
+          {:error, :not_latest} -> Repo.rollback(:not_latest_version)
           {:error, reason} -> Repo.rollback(reason)
         end
       end)
@@ -675,7 +684,10 @@ defmodule CapAlertWorkbench.CapAlert do
   defp upsert_from_import(identifier, attrs, actor) do
     case get_alert(identifier) do
       nil ->
-        create_alert(Map.put(attrs, "identifier", identifier), actor)
+        # External messages always enter the review queue, never as editable
+        # drafts, so an imported update cannot silently overwrite published
+        # region-level severity.
+        create_alert(Map.put(attrs, "identifier", identifier), actor, workflow_state: :in_review)
 
       %Alert{} = alert ->
         base = latest_version(alert) || published_version(alert)
@@ -686,7 +698,7 @@ defmodule CapAlertWorkbench.CapAlert do
           |> Map.merge(%{
             "alert_identifier" => identifier,
             "version_number" => number,
-            "workflow_state" => "draft",
+            "workflow_state" => "in_review",
             "based_on_version_id" => base && base.id
           })
 
@@ -699,7 +711,9 @@ defmodule CapAlertWorkbench.CapAlert do
                  {:ok, _alert} <-
                    Alert.changeset(alert, %{latest_version_id: new_version.id}) |> Repo.update(),
                  {:ok, _audit} <-
-                   record_audit(identifier, new_version.id, actor, "imported", %{}) do
+                   record_audit(identifier, new_version.id, actor, "imported", %{
+                     "workflow_state" => "in_review"
+                   }) do
               %{alert: alert, version: new_version}
             else
               {:error, reason} -> Repo.rollback(reason)
@@ -788,7 +802,8 @@ defmodule CapAlertWorkbench.CapAlert do
       alert = lock_alert(version.alert_identifier)
       locked = lock_version(version.id)
 
-      with :ok <- assert_latest(alert, locked),
+      with :ok <- assert_state_current(version, locked),
+           :ok <- assert_latest(alert, locked),
            {:ok, next_state} <- StateMachine.transition(locked.workflow_state, action),
            changeset <-
              change_fun.(locked)
@@ -798,9 +813,23 @@ defmodule CapAlertWorkbench.CapAlert do
              record_audit(alert.identifier, updated.id, actor, Atom.to_string(action), %{}) do
         updated
       else
+        {:error, :not_latest} -> Repo.rollback(:not_latest_version)
         {:error, reason} -> Repo.rollback(reason)
       end
     end)
+  end
+
+  # Guard that detects a stale client view: the caller passed a `version` struct
+  # whose `workflow_state` no longer matches the freshly-locked row. This rejects
+  # an old draft (e.g. a C1 draft held by another browser before it was
+  # published) being acted on after the live version has already moved on,
+  # returning `:not_latest_version` without mutating any region-level severity.
+  defp assert_state_current(client_version, locked) do
+    if client_version.workflow_state == locked.workflow_state do
+      :ok
+    else
+      {:error, :not_latest_version}
+    end
   end
 
   defp broadcast_on_ok({:ok, %AlertVersion{} = version} = result, message) do
