@@ -1,0 +1,538 @@
+<Layouts.app flash={@flash}>
+  <div class="flex items-center justify-between gap-4">
+    <div>
+      <.link navigate={~p"/messages"} class="text-sm text-base-content/60 hover:underline">
+        ← 返回列表
+      </.link>
+      <h1 class="text-2xl font-bold font-mono">{@message.identifier}</h1>
+      <div class="mt-1 flex items-center gap-2 text-sm">
+        <span class={["badge", workflow_badge(@message.workflow_state)]}>
+          {workflow_label(@message.workflow_state)}
+        </span>
+        <span class="badge badge-outline">{@message.msg_type}</span>
+        <span class="badge badge-outline">{@message.status}</span>
+        <span class="badge badge-outline">{@message.scope}</span>
+        <span class="text-base-content/50">锁版本 v{@message.lock_version}</span>
+      </div>
+    </div>
+
+    <div class="flex flex-wrap gap-2">
+      <button
+        :if={can_submit?(@message, @latest)}
+        id="submit-review-btn"
+        phx-click="submit_for_review"
+        class="btn btn-sm btn-warning"
+      >
+        提交复核
+      </button>
+      <button
+        :if={can_publish?(@message, @latest)}
+        id="publish-btn"
+        phx-click="publish"
+        data-confirm="确认发布？发布后内容将被冻结，只能通过更正或解除修改。"
+        class="btn btn-sm btn-success"
+      >
+        发布
+      </button>
+      <button
+        :if={can_derive?(@message)}
+        id="cancellation-btn"
+        phx-click="create_cancellation"
+        data-confirm="确认创建解除草稿？"
+        class="btn btn-sm btn-outline btn-error"
+      >
+        创建解除
+      </button>
+    </div>
+  </div>
+
+  <%= if @message.references_text do %>
+    <div class="rounded-md bg-info/10 px-4 py-2 text-sm">
+      引用消息：<span class="font-mono">{@message.references_text}</span>
+    </div>
+  <% end %>
+
+  <div role="tablist" class="tabs tabs-bordered" id="tabs">
+    <button
+      :for={
+        {key, label} <- [
+          {"editor", "草稿编辑"},
+          {"diff", "版本差异"},
+          {"review", "复核"},
+          {"publish", "发布/输出"},
+          {"audit", "审计/通知"}
+        ]
+      }
+      role="tab"
+      class={["tab", @tab == key && "tab-active"]}
+      id={"tab-#{key}"}
+      phx-click="switch_tab"
+      phx-value-tab={key}
+    >
+      {label}
+    </button>
+  </div>
+
+  <%!-- ================= EDITOR TAB ================= --%>
+  <div
+    :if={@tab == "editor"}
+    id="editor-panel"
+    class="card border border-base-300 bg-base-100 p-6"
+  >
+    <%= if can_edit?(@message) do %>
+      <p class="mb-4 text-sm text-base-content/70">
+        保存将创建一个新的不可变版本（当前最新为 v{@latest.version_number}）。可包含多个 info 段，每段有各自的地区、严重度、标题与描述。
+      </p>
+      <div :if={@edit_errors != []} class="mb-4 rounded-md bg-error/10 p-3 text-sm text-error">
+        <div :for={err <- @edit_errors}>{err}</div>
+      </div>
+      <form id="edit-form" phx-change="validate" phx-submit="save_version">
+        <div class="space-y-4">
+          <div
+            :for={{info, idx} <- Enum.with_index(@info_drafts)}
+            id={"info-block-#{idx}"}
+            class="rounded-lg border border-base-300 p-4"
+          >
+            <div class="flex items-center justify-between mb-3">
+              <span class="badge badge-outline">info 段 {idx + 1}</span>
+              <button
+                :if={length(@info_drafts) > 1}
+                type="button"
+                id={"remove-info-#{idx}"}
+                phx-click="remove_info"
+                phx-value-index={idx}
+                class="btn btn-xs btn-ghost text-error"
+              >
+                移除
+              </button>
+            </div>
+            <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <label class="form-control">
+                <span class="label-text">事件 (event)</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][event]"}
+                  value={info["event"]}
+                  class="input input-bordered input-sm"
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text">类别</span>
+                <select
+                  name={"draft[infos][#{idx}][category]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:categories)}
+                    value={val}
+                    selected={val == info["category"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">严重度 (severity)</span>
+                <select
+                  name={"draft[infos][#{idx}][severity]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:severities)}
+                    value={val}
+                    selected={val == info["severity"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">紧急度</span>
+                <select
+                  name={"draft[infos][#{idx}][urgency]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:urgencies)}
+                    value={val}
+                    selected={val == info["urgency"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">确定性</span>
+                <select
+                  name={"draft[infos][#{idx}][certainty]"}
+                  class="select select-bordered select-sm"
+                >
+                  <option
+                    :for={{label, val} <- enum_options(:certainties)}
+                    value={val}
+                    selected={val == info["certainty"]}
+                  >
+                    {label}
+                  </option>
+                </select>
+              </label>
+              <label class="form-control">
+                <span class="label-text">语言</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][language]"}
+                  value={info["language"]}
+                  class="input input-bordered input-sm"
+                />
+              </label>
+            </div>
+            <label class="form-control mt-2">
+              <span class="label-text">标题 (headline)</span>
+              <input
+                type="text"
+                name={"draft[infos][#{idx}][headline]"}
+                value={info["headline"]}
+                class="input input-bordered input-sm"
+              />
+            </label>
+            <label class="form-control mt-2">
+              <span class="label-text">描述 (description)</span>
+              <textarea
+                name={"draft[infos][#{idx}][description]"}
+                rows="2"
+                class="textarea textarea-bordered"
+              >{info["description"]}</textarea>
+            </label>
+            <label class="form-control mt-2">
+              <span class="label-text">处置建议 (instruction)</span>
+              <textarea
+                name={"draft[infos][#{idx}][instruction]"}
+                rows="2"
+                class="textarea textarea-bordered"
+              >{info["instruction"]}</textarea>
+            </label>
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+              <label class="form-control">
+                <span class="label-text">区域描述 (areaDesc)</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][area_description]"}
+                  value={info["area_description"]}
+                  class="input input-bordered input-sm"
+                />
+              </label>
+              <label class="form-control">
+                <span class="label-text">地区编码 (逗号分隔)</span>
+                <input
+                  type="text"
+                  name={"draft[infos][#{idx}][geocodes]"}
+                  value={info["geocodes"]}
+                  class="input input-bordered input-sm font-mono"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="mt-4 flex gap-2">
+          <button
+            type="button"
+            id="add-info-btn"
+            phx-click="add_info"
+            class="btn btn-sm btn-outline"
+          >
+            + 增加 info 段
+          </button>
+          <.button phx-disable-with="保存中…" class="btn btn-primary">保存为新版本</.button>
+        </div>
+      </form>
+    <% else %>
+      <div class="rounded-md bg-base-200 p-4 text-sm">
+        该消息处于 <strong>{workflow_label(@message.workflow_state)}</strong>
+        状态，内容已冻结，无法编辑。
+        <%= if @message.workflow_state == :published do %>
+          如需变更，请前往「发布/输出」标签按地区「创建更正」，或右上角「创建解除」。
+        <% end %>
+      </div>
+      <.version_readonly version={@latest} />
+    <% end %>
+  </div>
+
+  <%!-- ================= DIFF TAB ================= --%>
+  <div :if={@tab == "diff"} id="diff-panel" class="card border border-base-300 bg-base-100 p-6">
+    <form phx-change="set_diff" id="diff-form" class="flex flex-wrap items-end gap-4 mb-4">
+      <label class="form-control">
+        <span class="label-text">对比起点</span>
+        <select name="from" class="select select-bordered select-sm" id="diff-from">
+          <option
+            :for={v <- @versions}
+            value={v.id}
+            selected={v.id == @diff_from_id}
+          >
+            v{v.version_number} ({review_state_label(v.review_state)})
+          </option>
+        </select>
+      </label>
+      <label class="form-control">
+        <span class="label-text">对比终点</span>
+        <select name="to" class="select select-bordered select-sm" id="diff-to">
+          <option
+            :for={v <- @versions}
+            value={v.id}
+            selected={v.id == @diff_to_id}
+          >
+            v{v.version_number} ({review_state_label(v.review_state)})
+          </option>
+        </select>
+      </label>
+    </form>
+
+    <p class="text-sm text-base-content/70 mb-2">按地区展示变化：</p>
+    <div class="space-y-3" id="diff-regions">
+      <div
+        :for={row <- @diff}
+        id={"diff-region-#{row.geocode}"}
+        class={[
+          "rounded-lg border p-3",
+          row.status == :changed && "border-warning bg-warning/5",
+          row.status == :added && "border-success bg-success/5",
+          row.status == :removed && "border-error bg-error/5",
+          row.status == :unchanged && "border-base-300"
+        ]}
+      >
+        <div class="flex items-center gap-2 mb-1">
+          <span class="font-mono font-medium">{row.geocode}</span>
+          <span class="badge badge-sm">{region_status_label(row.status)}</span>
+        </div>
+        <table :if={row.status == :changed} class="table table-xs">
+          <thead>
+            <tr>
+              <th>字段</th>
+              <th>起点</th>
+              <th>终点</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr :for={change <- row.changes}>
+              <td class="font-medium">{field_label(change.field)}</td>
+              <td class="text-error whitespace-pre-wrap">{render_value(change.from)}</td>
+              <td class="text-success font-medium whitespace-pre-wrap">
+                {render_value(change.to)}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <%!-- ================= REVIEW TAB ================= --%>
+  <div
+    :if={@tab == "review"}
+    id="review-panel"
+    class="card border border-base-300 bg-base-100 p-6"
+  >
+    <div class="mb-4">
+      <h3 class="text-lg font-semibold">最新版本 v{@latest.version_number} 复核</h3>
+      <p class="text-sm text-base-content/70">
+        复核状态：<span class="badge badge-outline">{review_state_label(@latest.review_state)}</span>
+      </p>
+    </div>
+
+    <.version_readonly version={@latest} />
+
+    <%= cond do %>
+      <% can_review?(@message, @latest) -> %>
+        <form phx-change="set_review_comment" id="review-comment-form" class="mt-4">
+          <label class="form-control">
+            <span class="label-text">复核意见（可选）</span>
+            <textarea
+              name="comment"
+              id="review-comment"
+              class="textarea textarea-bordered"
+              rows="2"
+            >{@review_comment}</textarea>
+          </label>
+        </form>
+        <div class="mt-4 flex gap-2">
+          <button
+            id="approve-btn"
+            phx-click="review"
+            phx-value-decision="approve"
+            class="btn btn-success"
+          >
+            通过复核
+          </button>
+          <button
+            id="reject-btn"
+            phx-click="review"
+            phx-value-decision="reject"
+            class="btn btn-error btn-outline"
+          >
+            退回修改
+          </button>
+        </div>
+      <% @latest.review_state == :approved -> %>
+        <div class="mt-4 rounded-md bg-success/10 p-4 text-sm">
+          v{@latest.version_number} 已通过复核（复核人：{@latest.reviewed_by}）。可前往「发布/输出」标签发布。
+        </div>
+      <% true -> %>
+        <div class="mt-4 rounded-md bg-base-200 p-4 text-sm">
+          当前版本尚未提交复核，或消息未处于复核状态。请先在「草稿编辑」标签提交复核。
+        </div>
+    <% end %>
+  </div>
+
+  <%!-- ================= PUBLISH / OUTPUT TAB ================= --%>
+  <div
+    :if={@tab == "publish"}
+    id="publish-panel"
+    class="card border border-base-300 bg-base-100 p-6"
+  >
+    <div class="flex items-center justify-between mb-4">
+      <h3 class="text-lg font-semibold">发布与 CAP XML 输出</h3>
+      <button
+        :if={@latest}
+        id="preview-xml-btn"
+        phx-click="preview_xml"
+        phx-value-version_id={@latest.id}
+        class="btn btn-sm btn-outline"
+      >
+        预览最新版本 XML
+      </button>
+    </div>
+
+    <%= if @published_version do %>
+      <div class="rounded-md bg-success/10 p-4 text-sm mb-4">
+        已发布版本 v{@published_version.version_number}，发布时间 {@published_version.published_at &&
+          Calendar.strftime(@published_version.published_at, "%Y-%m-%d %H:%M:%S")}。内容已冻结。
+      </div>
+      <.version_readonly version={@published_version} />
+
+      <%!-- Per-region correction: pick a target severity per geocode --%>
+      <div
+        :if={can_derive?(@message)}
+        class="mt-6 rounded-lg border border-base-300 p-4"
+        id="correction-panel"
+      >
+        <h4 class="font-semibold mb-2">按地区创建更正</h4>
+        <p class="text-sm text-base-content/70 mb-3">
+          为每个地区选择目标严重度；仅严重度变化的地区会拆分为独立 info 段（例如 440900 升为 Extreme，440800 保持 Severe）。
+        </p>
+        <div class="space-y-2">
+          <div
+            :for={{geocode, severity} <- Enum.sort(@region_severities)}
+            id={"region-row-#{geocode}"}
+            class="flex items-center gap-3"
+          >
+            <span class="font-mono w-24">{geocode}</span>
+            <form phx-change="set_region_severity" id={"region-form-#{geocode}"}>
+              <input type="hidden" name="geocode" value={geocode} />
+              <select
+                name="severity"
+                class="select select-bordered select-sm"
+                id={"region-sev-#{geocode}"}
+              >
+                <option
+                  :for={{label, val} <- enum_options(:severities)}
+                  value={val}
+                  selected={val == severity}
+                >
+                  {label}
+                </option>
+              </select>
+            </form>
+          </div>
+        </div>
+        <button
+          id="correction-btn"
+          phx-click="create_correction"
+          data-confirm="确认基于最新已发布文档创建更正？"
+          class="btn btn-sm btn-primary mt-3"
+        >
+          创建更正 (C1)
+        </button>
+      </div>
+    <% else %>
+      <%= if can_publish?(@message, @latest) do %>
+        <div class="rounded-md bg-warning/10 p-4 text-sm">
+          v{@latest.version_number} 已通过复核，可以发布。
+          <button
+            phx-click="publish"
+            data-confirm="确认发布？"
+            class="btn btn-sm btn-success ml-2"
+          >
+            立即发布
+          </button>
+        </div>
+      <% else %>
+        <div class="rounded-md bg-base-200 p-4 text-sm">
+          只有通过复核的最新草稿版本才能发布。请先完成复核。
+        </div>
+      <% end %>
+    <% end %>
+
+    <%= if @xml_preview do %>
+      <div class="mt-4">
+        <div class="flex items-center justify-between mb-2">
+          <h4 class="font-medium">CAP 1.2 XML</h4>
+          <button phx-click="close_xml" class="btn btn-xs btn-ghost">关闭</button>
+        </div>
+        <pre
+          class="overflow-x-auto rounded-md bg-base-300 p-4 text-xs"
+          id="xml-preview"
+          phx-no-curly-interpolation
+        ><%= @xml_preview %></pre>
+      </div>
+    <% end %>
+  </div>
+
+  <%!-- ================= AUDIT / OUTBOX TAB ================= --%>
+  <div :if={@tab == "audit"} id="audit-panel" class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+    <div class="card border border-base-300 bg-base-100 p-6">
+      <h3 class="text-lg font-semibold mb-3">审计事件</h3>
+      <ol class="space-y-2" id="audit-events">
+        <li
+          :for={e <- @audit_events}
+          id={"audit-#{e.id}"}
+          class="border-l-2 border-base-300 pl-3 text-sm"
+        >
+          <div class="font-medium">{e.action}</div>
+          <div class="text-base-content/60">
+            {e.actor} · {Calendar.strftime(e.occurred_at, "%Y-%m-%d %H:%M:%S")}
+            <%= if e.from_state || e.to_state do %>
+              · {e.from_state} → {e.to_state}
+            <% end %>
+          </div>
+        </li>
+      </ol>
+    </div>
+
+    <div class="card border border-base-300 bg-base-100 p-6">
+      <h3 class="text-lg font-semibold mb-3">通知 Outbox</h3>
+      <ul class="space-y-2" id="outbox-entries">
+        <li
+          :for={o <- @outbox_entries}
+          id={"outbox-#{o.id}"}
+          class="border border-base-200 rounded-md p-3 text-sm"
+        >
+          <div class="flex items-center gap-2">
+            <span class="badge badge-outline">{o.event_type}</span>
+            <span class={[
+              "badge",
+              o.status == :delivered && "badge-success",
+              o.status == :pending && "badge-warning"
+            ]}>
+              {o.status}
+            </span>
+          </div>
+          <div class="text-base-content/60 mt-1 font-mono text-xs break-all">
+            dedupe: {o.dedupe_key}
+          </div>
+        </li>
+        <li :if={@outbox_entries == []} class="text-sm text-base-content/50">
+          暂无通知记录。
+        </li>
+      </ul>
+    </div>
+  </div>
+</Layouts.app>
