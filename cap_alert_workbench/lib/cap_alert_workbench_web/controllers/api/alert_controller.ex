@@ -54,8 +54,11 @@ defmodule CapAlertWorkbenchWeb.Api.AlertController do
 
   def submit(conn, %{"id" => id} = params) do
     case Cap.submit_for_review(id, params["actor"]) do
-      {:ok, %{alert: alert}} -> json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
-      {:error, reason} -> conn |> put_status(:conflict) |> json(%{error: inspect(reason)})
+      {:ok, %{alert: alert}} ->
+        json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+
+      {:error, reason} ->
+        conn |> put_status(:conflict) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -66,21 +69,29 @@ defmodule CapAlertWorkbenchWeb.Api.AlertController do
     }
 
     case Cap.decide_review(id, review_params, params["actor"]) do
-      {:ok, %{alert: alert}} -> json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+      {:ok, %{alert: alert}} ->
+        json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+
       {:error, {:stale_review, old, new}} ->
         conn
         |> put_status(:conflict)
         |> json(%{error: "stale_review", decision_revision: old, current_revision: new})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
   def publish(conn, %{"id" => id} = params) do
     case Cap.publish(id, params["actor"]) do
-      {:ok, %{alert: alert}} -> json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+      {:ok, %{alert: alert}} ->
+        json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+
       {:error, :already_published} ->
         conn |> put_status(:conflict) |> json(%{error: "already_published"})
-      {:error, reason} -> conn |> put_status(:conflict) |> json(%{error: inspect(reason)})
+
+      {:error, reason} ->
+        conn |> put_status(:conflict) |> json(%{error: inspect(reason)})
     end
   end
 
@@ -88,15 +99,21 @@ defmodule CapAlertWorkbenchWeb.Api.AlertController do
     attrs = Map.take(params, ["headline", "description", "instruction", "note"])
 
     case Cap.create_correction(id, attrs, params["actor"]) do
-      {:ok, %{alert: alert}} -> json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      {:ok, %{alert: alert}} ->
+        json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 
   def cancel(conn, %{"id" => id} = params) do
     case Cap.create_cancellation(id, %{"note" => params["note"]}, params["actor"]) do
-      {:ok, %{alert: alert}} -> json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
-      {:error, reason} -> conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
+      {:ok, %{alert: alert}} ->
+        json(conn, %{data: serialize_alert(alert, Cap.list_versions(alert.id))})
+
+      {:error, reason} ->
+        conn |> put_status(:unprocessable_entity) |> json(%{error: inspect(reason)})
     end
   end
 

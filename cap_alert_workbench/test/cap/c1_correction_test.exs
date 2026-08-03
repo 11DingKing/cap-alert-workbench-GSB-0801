@@ -2,7 +2,7 @@ defmodule CapAlertWorkbench.Cap.C1CorrectionTest do
   use CapAlertWorkbench.DataCase, async: false
 
   alias CapAlertWorkbench.Cap
-  alias CapAlertWorkbench.Cap.{Info, Message, Version}
+  alias CapAlertWorkbench.Cap.{Message, Version}
   alias CapAlertWorkbench.Repo
 
   import Ecto.Query
@@ -26,7 +26,7 @@ defmodule CapAlertWorkbench.Cap.C1CorrectionTest do
   test "C1 correction derives from the latest published version and produces two info segments" do
     alert = publish_initial()
 
-    assert {:ok, %{alert: corrected, new_version: %{version: version}}} =
+    assert {:ok, %{alert: _corrected, new_version: %{version: version}}} =
              Cap.create_correction_c1(alert.id, "publisher")
 
     # The new version is published and carries the C1 identifier.
@@ -89,9 +89,7 @@ defmodule CapAlertWorkbench.Cap.C1CorrectionTest do
 
   test "per-area diff reports 440900 severity as modified and 440800 unchanged" do
     alert = publish_initial()
-    {:ok, %{new_version: %{version: c1}}} = Cap.create_correction_c1(alert.id, "publisher")
-
-    root = Repo.one!(from v in Version, where: v.alert_id == ^alert.id and v.version_number == 1)
+    {:ok, %{new_version: %{version: _c1}}} = Cap.create_correction_c1(alert.id, "publisher")
 
     {:ok, diff} = Cap.diff_versions(alert.id, 1, 2)
     changes = CapAlertWorkbench.Cap.VersionDiff.changed_fields(diff)

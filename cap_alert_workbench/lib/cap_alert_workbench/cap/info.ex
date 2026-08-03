@@ -17,6 +17,13 @@ defmodule CapAlertWorkbench.Cap.Info do
           description: String.t()
         }
 
+  @type extension_node :: %{
+          name: String.t(),
+          ns: String.t(),
+          attrs: %{String.t() => String.t()},
+          children: [String.t() | extension_node()]
+        }
+
   @type t :: %__MODULE__{
           language: String.t(),
           event: String.t(),
@@ -27,7 +34,8 @@ defmodule CapAlertWorkbench.Cap.Info do
           description: String.t() | nil,
           instruction: String.t() | nil,
           category: String.t(),
-          areas: [area()]
+          areas: [area()],
+          extensions: [extension_node()]
         }
 
   @enforce_keys [:language, :event, :urgency, :severity, :certainty, :areas]
@@ -41,7 +49,8 @@ defmodule CapAlertWorkbench.Cap.Info do
     :description,
     :instruction,
     category: "Met",
-    areas: []
+    areas: [],
+    extensions: []
   ]
 
   @doc "Validates an info segment."

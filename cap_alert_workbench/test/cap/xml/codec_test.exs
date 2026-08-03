@@ -93,16 +93,27 @@ defmodule CapAlertWorkbench.Cap.Xml.CodecTest do
     test "preserves unknown extension fields for round-trip" do
       message = %{
         Codec.seed_message()
-        | extensions: [{"gd:channel", [{"type", "sms"}], "请立即处置"}]
+        | extensions: [
+            %{
+              name: "gd:channel",
+              ns: "",
+              attrs: %{"type" => "sms"},
+              children: ["请立即处置"]
+            }
+          ]
       }
 
       xml = Codec.encode!(message)
       assert {:ok, decoded} = Codec.decode(xml)
 
       assert length(decoded.extensions) >= 1
-      {name, _attrs, value} = hd(decoded.extensions)
-      assert name == "gd:channel"
-      assert value =~ "请立即处置"
+      ext = hd(decoded.extensions)
+      assert ext.name == "gd:channel"
+      assert ext.attrs["type"] == "sms"
+      assert ext.children |> Enum.join("") |> String.trim() == "请立即处置"
+
+      # Re-encoding is byte-identical (extensions round-trip exactly).
+      assert Codec.encode!(decoded) == xml
     end
   end
 

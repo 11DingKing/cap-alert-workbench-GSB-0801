@@ -37,7 +37,9 @@ defmodule CapAlertWorkbench.Cap.Enums do
     :correction_created,
     :cancellation_created,
     :xml_imported,
-    :xml_exported
+    :xml_exported,
+    :external_import,
+    :stale_draft_rejected
   ]
 
   @outbox_statuses [:pending, :delivered, :failed]
@@ -56,32 +58,48 @@ defmodule CapAlertWorkbench.Cap.Enums do
 
   for value <- @statuses do
     def status_to_string(unquote(value)), do: unquote(value |> to_string() |> String.capitalize())
-    def status_from_string(unquote(value |> to_string() |> String.capitalize())), do: unquote(value)
+
+    def status_from_string(unquote(value |> to_string() |> String.capitalize())),
+      do: unquote(value)
   end
 
   for value <- @msg_types do
-    def msg_type_to_string(unquote(value)), do: unquote(value |> to_string() |> String.capitalize())
-    def msg_type_from_string(unquote(value |> to_string() |> String.capitalize())), do: unquote(value)
+    def msg_type_to_string(unquote(value)),
+      do: unquote(value |> to_string() |> String.capitalize())
+
+    def msg_type_from_string(unquote(value |> to_string() |> String.capitalize())),
+      do: unquote(value)
   end
 
   for value <- @scopes do
     def scope_to_string(unquote(value)), do: unquote(value |> to_string() |> String.capitalize())
-    def scope_from_string(unquote(value |> to_string() |> String.capitalize())), do: unquote(value)
+
+    def scope_from_string(unquote(value |> to_string() |> String.capitalize())),
+      do: unquote(value)
   end
 
   for value <- @urgencies do
-    def urgency_to_string(unquote(value)), do: unquote(value |> to_string() |> String.capitalize())
-    def urgency_from_string(unquote(value |> to_string() |> String.capitalize())), do: unquote(value)
+    def urgency_to_string(unquote(value)),
+      do: unquote(value |> to_string() |> String.capitalize())
+
+    def urgency_from_string(unquote(value |> to_string() |> String.capitalize())),
+      do: unquote(value)
   end
 
   for value <- @severities do
-    def severity_to_string(unquote(value)), do: unquote(value |> to_string() |> String.capitalize())
-    def severity_from_string(unquote(value |> to_string() |> String.capitalize())), do: unquote(value)
+    def severity_to_string(unquote(value)),
+      do: unquote(value |> to_string() |> String.capitalize())
+
+    def severity_from_string(unquote(value |> to_string() |> String.capitalize())),
+      do: unquote(value)
   end
 
   for value <- @certainties do
-    def certainty_to_string(unquote(value)), do: unquote(value |> to_string() |> String.capitalize())
-    def certainty_from_string(unquote(value |> to_string() |> String.capitalize())), do: unquote(value)
+    def certainty_to_string(unquote(value)),
+      do: unquote(value |> to_string() |> String.capitalize())
+
+    def certainty_from_string(unquote(value |> to_string() |> String.capitalize())),
+      do: unquote(value)
   end
 
   for value <- @version_statuses do

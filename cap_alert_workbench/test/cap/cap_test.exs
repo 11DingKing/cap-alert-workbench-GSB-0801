@@ -7,7 +7,7 @@ defmodule CapAlertWorkbench.CapTest do
 
   import Ecto.Query
 
-  defp seed_attrs(overrides \\ []) do
+  defp seed_attrs(overrides) do
     message = Cap.Xml.Codec.seed_message(overrides)
 
     message
@@ -81,7 +81,9 @@ defmodule CapAlertWorkbench.CapTest do
 
       assert reviewed.status == :approved
 
-      assert {:ok, %{alert: published, publish: %{version: version}}} = Cap.publish(reviewed.id, "publisher")
+      assert {:ok, %{alert: published, publish: %{version: version}}} =
+               Cap.publish(reviewed.id, "publisher")
+
       assert published.status == :published
       assert published.latest_published_version == 1
       assert version.status == :published
@@ -149,13 +151,18 @@ defmodule CapAlertWorkbench.CapTest do
     test "published content cannot be edited through the draft API" do
       alert = create_alert()
       {:ok, %{alert: submitted}} = Cap.submit_for_review(alert.id, "author")
-      {:ok, %{alert: reviewed}} = Cap.decide_review(submitted.id, %{"decision" => "approved"}, "r")
+
+      {:ok, %{alert: reviewed}} =
+        Cap.decide_review(submitted.id, %{"decision" => "approved"}, "r")
+
       {:ok, %{alert: published}} = Cap.publish(reviewed.id, "publisher")
 
       # update_draft locks FOR UPDATE and then writes; but after publication the
       # status is :published. The service still allows draft edits only if the
       # alert is in an editable status, so verify it rejects accordingly.
-      result = Cap.update_draft(published.id, published.draft_lock_version, %{"headline" => "x"}, "e")
+      result =
+        Cap.update_draft(published.id, published.draft_lock_version, %{"headline" => "x"}, "e")
+
       assert {:error, _} = result
     end
   end
@@ -164,7 +171,10 @@ defmodule CapAlertWorkbench.CapTest do
     setup do
       alert = create_alert()
       {:ok, %{alert: submitted}} = Cap.submit_for_review(alert.id, "author")
-      {:ok, %{alert: reviewed}} = Cap.decide_review(submitted.id, %{"decision" => "approved"}, "r")
+
+      {:ok, %{alert: reviewed}} =
+        Cap.decide_review(submitted.id, %{"decision" => "approved"}, "r")
+
       {:ok, %{alert: published}} = Cap.publish(reviewed.id, "publisher")
       %{alert: published}
     end

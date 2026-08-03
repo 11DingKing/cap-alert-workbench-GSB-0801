@@ -23,6 +23,7 @@ defmodule CapAlertWorkbench.Cap do
     VersionDiff,
     VersionStateMachine
   }
+
   alias CapAlertWorkbench.Cap.Xml.Codec, as: XmlCodec
 
   alias CapAlertWorkbench.Repo
@@ -247,6 +248,150 @@ defmodule CapAlertWorkbench.Cap do
         {:error, reason}
     end
   end
+
+  @doc """
+  Applies a draft edit that was authored against a specific published base
+  version.
+
+  `expected_version` is the version number the author worked from. If the
+  alert has since been corrected (e.g. C1 created version 2 while the editor
+  was still on version 1), the edit is rejected with
+  `{:error, :not_latest_version}` and no state is mutated. This prevents an
+  old round-1 draft from overwriting round-2 area-level severities.
+
+  The optimistic `expected_lock_version` check still applies on top of this
+  base-version check, so concurrent editors on the same base version are
+  serialised.
+  """
+  @spec submit_draft_based_on_version(
+          String.t(),
+          integer(),
+          integer() | nil,
+          map(),
+          String.t() | nil
+        ) :: result()
+  def submit_draft_based_on_version(
+        alert_id,
+        expected_version,
+        expected_lock_version,
+        attrs,
+        actor \\ nil
+      ) do
+    with {:ok, alert} <- fetch_alert(alert_id) do
+      Multi.new()
+      |> Multi.run(:alert_lock, fn repo, _ ->
+        locked =
+          from(a in Alert, where: a.id == ^alert.id, lock: "FOR UPDATE")
+          |> repo.one!()
+
+        cond do
+          not is_nil(locked.latest_published_version) and
+              expected_version != locked.latest_published_version ->
+            {:error, {:not_latest_version, expected_version, locked.latest_published_version}}
+
+          expected_lock_version not in [nil, locked.draft_lock_version] ->
+            {:error, {:lock_version_mismatch, locked.draft_lock_version, expected_lock_version}}
+
+          not VersionStateMachine.editable?(locked.status) ->
+            {:error, {:draft_not_editable, locked.status}}
+
+          true ->
+            {:ok, locked}
+        end
+      end)
+      |> Multi.run(:validate, fn _repo, %{alert_lock: locked} ->
+        merged =
+          locked.draft_payload
+          |> map_to_message()
+          |> merge_message(attrs)
+
+        with {:ok, message} <- Message.validate(merged),
+             :ok <- AreaCodes.validate_codes(message.area_codes) do
+          {:ok, message}
+        end
+      end)
+      |> Multi.run(:alert, fn repo, %{alert_lock: locked, validate: message} ->
+        new_lock = locked.draft_lock_version + 1
+        new_revision = locked.draft_revision + 1
+
+        new_status =
+          case locked.status do
+            :in_review -> :draft
+            other -> other
+          end
+
+        locked
+        |> Alert.changeset(%{
+          draft_payload: message_to_map(message),
+          draft_lock_version: new_lock,
+          draft_revision: new_revision,
+          status: new_status,
+          last_activity_at: utc_now()
+        })
+        |> repo.update()
+      end)
+      |> Multi.run(:stale_reviews, fn repo, %{alert: updated} ->
+        {count, _} =
+          from(r in Review,
+            where: r.alert_id == ^updated.id and r.stale == false,
+            update: [set: [stale: true]]
+          )
+          |> repo.update_all([])
+
+        {:ok, count}
+      end)
+      |> Multi.run(:audit, fn repo, %{alert: updated} ->
+        event =
+          build_audit(updated, :draft_updated, actor,
+            summary: "Draft updated (based on version #{expected_version})",
+            metadata: %{
+              revision: updated.draft_revision,
+              lock_version: updated.draft_lock_version,
+              base_version: expected_version
+            }
+          )
+
+        {:ok, repo.insert!(event)}
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{alert: alert} = result} ->
+          broadcast(alert, :draft_updated)
+
+          {:ok,
+           Map.put(result, :alert, Repo.preload(alert, [:versions, :reviews, :audit_events]))}
+
+        {:error, :alert_lock, reason, _changes} ->
+          maybe_record_stale_rejection(alert_id, expected_version, reason, actor)
+          {:error, reason}
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp maybe_record_stale_rejection(
+         alert_id,
+         expected_version,
+         {:not_latest_version, _, latest},
+         actor
+       ) do
+    with {:ok, alert} <- fetch_alert(alert_id) do
+      event =
+        build_audit(alert, :stale_draft_rejected, actor,
+          summary:
+            "Rejected draft based on stale version #{expected_version} (latest: #{latest})",
+          metadata: %{base_version: expected_version, latest_version: latest}
+        )
+
+      Repo.insert!(event)
+    end
+
+    :ok
+  end
+
+  defp maybe_record_stale_rejection(_, _, _, _), do: :ok
 
   @doc """
   Submits the current draft for review. Creates a `:in_review` immutable
@@ -518,10 +663,8 @@ defmodule CapAlertWorkbench.Cap do
         "440900" => :extreme
       },
       "headline" => "广东省暴雨红色预警（更正 C1）：茂名升级为 Extreme",
-      "description" =>
-        "更正：湛江市维持 Severe，茂名市升级为 Extreme。两地区分别通过独立的 info 段描述。",
-      "instruction" =>
-        "茂名市按 Extreme 级别响应，湛江市按 Severe 级别响应。"
+      "description" => "更正：湛江市维持 Severe，茂名市升级为 Extreme。两地区分别通过独立的 info 段描述。",
+      "instruction" => "茂名市按 Extreme 级别响应，湛江市按 Severe 级别响应。"
     }
 
     create_follow_up(alert_id, attrs, actor, :correction, :update,
@@ -583,6 +726,80 @@ defmodule CapAlertWorkbench.Cap do
     end
   end
 
+  @doc """
+  Imports an external CAP XML document as a new alert thread and immediately
+  places it into review.
+
+  Unlike `import_xml/2`, which creates an editable draft, this creates an
+  immutable `:in_review` version snapshot directly. Imported documents are
+  never auto-published; a reviewer must approve and publish them. The XML
+  (including special characters and unknown extension nodes) is preserved
+  verbatim on the version as `xml_snapshot` so it round-trips exactly.
+  """
+  @spec import_xml_for_review(String.t(), String.t() | nil) :: result()
+  def import_xml_for_review(xml, actor \\ nil) when is_binary(xml) do
+    with {:ok, message} <- XmlCodec.decode(xml),
+         :ok <- AreaCodes.validate_codes(message.area_codes) do
+      payload = message_to_map(message)
+
+      Multi.new()
+      |> Multi.run(:alert, fn repo, _ ->
+        %Alert{}
+        |> Alert.changeset(%{
+          identifier: message.identifier,
+          sender: message.sender,
+          draft_payload: payload,
+          draft_lock_version: 1,
+          draft_revision: 1,
+          status: :in_review,
+          last_activity_at: utc_now()
+        })
+        |> repo.insert()
+      end)
+      |> Multi.run(:version, fn repo, %{alert: alert} ->
+        %Version{}
+        |> Version.changeset(%{
+          alert_id: alert.id,
+          version_number: 1,
+          status: :in_review,
+          kind: :draft,
+          payload: payload,
+          xml_snapshot: XmlCodec.encode!(message),
+          revision_seed: 1,
+          created_by: actor
+        })
+        |> repo.insert()
+      end)
+      |> Multi.run(:audit, fn repo, %{alert: alert, version: version} ->
+        event =
+          build_audit(alert, :external_import, actor,
+            summary: "Imported external message #{message.identifier} for review",
+            version: version,
+            metadata: %{identifier: message.identifier, source: :external_import}
+          )
+
+        {:ok, repo.insert!(event)}
+      end)
+      |> Multi.run(:outbox, fn repo, %{alert: alert} ->
+        insert_outbox(repo, alert, "alert.review.submitted", %{
+          alert_id: alert.id,
+          identifier: alert.identifier,
+          source: :external_import
+        })
+      end)
+      |> Repo.transaction()
+      |> case do
+        {:ok, %{alert: alert} = result} ->
+          preloaded = Repo.preload(alert, [:versions, :reviews, :audit_events])
+          broadcast(preloaded, :alert_imported)
+          {:ok, Map.merge(result, %{alert: preloaded, message: message})}
+
+        {:error, _step, reason, _changes} ->
+          {:error, reason}
+      end
+    end
+  end
+
   @doc "Encodes the current draft or a published version as CAP XML."
   def export_xml(alert, version_number \\ nil) do
     message =
@@ -600,7 +817,7 @@ defmodule CapAlertWorkbench.Cap do
     XmlCodec.encode!(message)
   end
 
-  defp create_follow_up(alert_id, attrs, actor, kind, msg_type, opts \\ []) do
+  defp create_follow_up(alert_id, attrs, actor, kind, msg_type, opts) do
     new_identifier = Keyword.get(opts, :identifier)
     precise_ref = Keyword.get(opts, :precise_reference)
 
@@ -616,7 +833,27 @@ defmodule CapAlertWorkbench.Cap do
         {:ok, alert}
       end
     end)
-    |> Multi.run(:published, fn repo, %{alert_lock: alert} ->
+    |> Multi.run(:idempotency, fn repo, %{alert_lock: alert} ->
+      # When a fixed identifier is supplied (e.g. C1), reject if a version
+      # carrying that identifier already exists. Runs after the FOR UPDATE row
+      # lock so concurrent transactions serialize and only one can win.
+      if is_binary(new_identifier) do
+        exists? =
+          Version
+          |> where([v], v.alert_id == ^alert.id)
+          |> where([v], fragment("payload->>'identifier' = ?", ^new_identifier))
+          |> repo.exists?()
+
+        if exists? do
+          {:error, {:already_exists, new_identifier}}
+        else
+          {:ok, :not_found}
+        end
+      else
+        {:ok, :not_applicable}
+      end
+    end)
+    |> Multi.run(:published, fn repo, %{alert_lock: alert, idempotency: _} ->
       version =
         Version
         |> where([v], v.alert_id == ^alert.id and v.status == :published)
@@ -950,27 +1187,63 @@ defmodule CapAlertWorkbench.Cap do
   defp build_message(attrs) do
     message = XmlCodec.seed_message([])
 
-    Enum.reduce(attrs, message, fn
-      {:identifier, v}, acc -> %{acc | identifier: v}
-      {:sender, v}, acc -> %{acc | sender: v}
-      {:sent_at, v}, acc -> %{acc | sent_at: to_datetime(v)}
-      {:status, v}, acc -> %{acc | status: cast_enum(v, &Enums.cast_status/1)}
-      {:msg_type, v}, acc -> %{acc | msg_type: cast_enum(v, &Enums.cast_msg_type/1)}
-      {:scope, v}, acc -> %{acc | scope: cast_enum(v, &Enums.cast_scope/1)}
-      {:language, v}, acc -> %{acc | language: v}
-      {:urgency, v}, acc -> %{acc | urgency: cast_enum(v, &Enums.cast_urgency/1)}
-      {:severity, v}, acc -> %{acc | severity: cast_enum(v, &Enums.cast_severity/1)}
-      {:certainty, v}, acc -> %{acc | certainty: cast_enum(v, &Enums.cast_certainty/1)}
-      {:event, v}, acc -> %{acc | event: v}
-      {:headline, v}, acc -> %{acc | headline: v}
-      {:description, v}, acc -> %{acc | description: v}
-      {:instruction, v}, acc -> %{acc | instruction: v}
-      {:note, v}, acc -> %{acc | note: v}
-      {:area_codes, v}, acc -> %{acc | area_codes: List.wrap(v)}
-      {:references, v}, acc -> %{acc | references: List.wrap(v)}
-      {:extensions, v}, acc -> %{acc | extensions: List.wrap(v)}
-      _, acc -> acc
-    end)
+    message =
+      Enum.reduce(attrs, message, fn
+        {:identifier, v}, acc -> %{acc | identifier: v}
+        {:sender, v}, acc -> %{acc | sender: v}
+        {:sent_at, v}, acc -> %{acc | sent_at: to_datetime(v)}
+        {:status, v}, acc -> %{acc | status: cast_enum(v, &Enums.cast_status/1)}
+        {:msg_type, v}, acc -> %{acc | msg_type: cast_enum(v, &Enums.cast_msg_type/1)}
+        {:scope, v}, acc -> %{acc | scope: cast_enum(v, &Enums.cast_scope/1)}
+        {:language, v}, acc -> %{acc | language: v}
+        {:urgency, v}, acc -> %{acc | urgency: cast_enum(v, &Enums.cast_urgency/1)}
+        {:severity, v}, acc -> %{acc | severity: cast_enum(v, &Enums.cast_severity/1)}
+        {:certainty, v}, acc -> %{acc | certainty: cast_enum(v, &Enums.cast_certainty/1)}
+        {:event, v}, acc -> %{acc | event: v}
+        {:headline, v}, acc -> %{acc | headline: v}
+        {:description, v}, acc -> %{acc | description: v}
+        {:instruction, v}, acc -> %{acc | instruction: v}
+        {:note, v}, acc -> %{acc | note: v}
+        {:area_codes, v}, acc -> put_area_codes(acc, List.wrap(v))
+        {:references, v}, acc -> %{acc | references: List.wrap(v)}
+        {:extensions, v}, acc -> %{acc | extensions: List.wrap(v)}
+        {:infos, v}, acc when is_list(v) -> %{acc | infos: Enum.map(v, &info_from_map/1)}
+        _, acc -> acc
+      end)
+
+    sync_message_fields(message)
+  end
+
+  defp put_area_codes(message, []), do: message
+
+  defp put_area_codes(message, codes) do
+    areas =
+      Enum.map(codes, fn code ->
+        %{code: code, description: AreaCodes.description(code) || code}
+      end)
+
+    infos =
+      case message.infos do
+        [first | rest] ->
+          [%{first | areas: areas} | rest]
+
+        [] ->
+          [
+            %Info{
+              language: message.language || "zh-CN",
+              event: message.event,
+              urgency: message.urgency,
+              severity: message.severity,
+              certainty: message.certainty,
+              headline: message.headline,
+              description: message.description,
+              instruction: message.instruction,
+              areas: areas
+            }
+          ]
+      end
+
+    %{message | infos: infos}
   end
 
   defp merge_message(message, attrs) when is_map(attrs) do
@@ -1145,7 +1418,8 @@ defmodule CapAlertWorkbench.Cap do
       "areas" =>
         Enum.map(info.areas, fn area ->
           %{"code" => area.code, "description" => area.description}
-        end)
+        end),
+      "extensions" => encode_extensions(info.extensions)
     }
   end
 
@@ -1162,7 +1436,8 @@ defmodule CapAlertWorkbench.Cap do
       description: map["description"] || map[:description],
       instruction: map["instruction"] || map[:instruction],
       category: map["category"] || map[:category] || "Met",
-      areas: parse_areas(map["areas"] || map[:areas] || [])
+      areas: parse_areas(map["areas"] || map[:areas] || []),
+      extensions: decode_extensions(map["extensions"] || map[:extensions] || [])
     }
   end
 
@@ -1242,18 +1517,64 @@ defmodule CapAlertWorkbench.Cap do
   end
 
   defp encode_extensions(nil), do: []
-  defp encode_extensions(exts), do: Enum.map(exts, &Tuple.to_list/1)
+  defp encode_extensions(exts) when is_list(exts), do: Enum.map(exts, &encode_extension/1)
+
+  # Full node-tree maps are JSON-serialisable as-is (preserving nested trees).
+  defp encode_extension(%{"name" => _} = node), do: node
+  defp encode_extension(%{name: _} = node), do: node
+
+  # Legacy tuple forms.
+  defp encode_extension({name, attrs, value}), do: [name, attrs, value]
+  defp encode_extension([name, attrs, value]), do: [name, attrs, value]
 
   defp decode_extensions(nil), do: []
 
   defp decode_extensions(exts) when is_list(exts) do
-    Enum.map(exts, fn
-      [name, attrs, value] -> {name, attrs, value}
-      other -> other
-    end)
+    Enum.map(exts, &decode_extension/1)
   end
 
   defp decode_extensions(_), do: []
+
+  defp decode_extension(%{"name" => name} = node) do
+    %{
+      name: name,
+      ns: node["ns"] || "",
+      attrs: atom_keys_to_string(node["attrs"] || %{}),
+      children: decode_extension_children(node["children"] || [])
+    }
+  end
+
+  defp decode_extension(%{name: name} = node) do
+    %{
+      name: name,
+      ns: node[:ns] || "",
+      attrs: atom_keys_to_string(node[:attrs] || %{}),
+      children: decode_extension_children(node[:children] || [])
+    }
+  end
+
+  defp decode_extension([name, attrs, value]), do: {name, attrs, value}
+  defp decode_extension(other), do: other
+
+  defp decode_extension_children(children) when is_list(children) do
+    Enum.map(children, fn
+      %{"name" => _} = child -> decode_extension(child)
+      %{name: _} = child -> decode_extension(child)
+      text when is_binary(text) -> text
+      other -> to_string(other)
+    end)
+  end
+
+  defp decode_extension_children(_), do: []
+
+  defp atom_keys_to_string(map) when is_map(map) do
+    Map.new(map, fn
+      {k, v} when is_atom(k) -> {Atom.to_string(k), v}
+      {k, v} -> {k, v}
+    end)
+  end
+
+  defp atom_keys_to_string(other), do: other
 
   defp atomize(value, allowed) when is_binary(value) do
     atom = String.to_existing_atom(value)

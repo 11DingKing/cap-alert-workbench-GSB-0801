@@ -24,9 +24,7 @@ defmodule CapAlertWorkbench.Repo.Migrations.CreateCapAlertVersions do
     create index(:cap_alert_versions, [:alert_id, :status])
     create index(:cap_alert_versions, [:superseded_by])
 
-    create constraint(:cap_alert_versions, :version_number_positive,
-             check: "version_number >= 1"
-           )
+    create constraint(:cap_alert_versions, :version_number_positive, check: "version_number >= 1")
 
     create constraint(:cap_alert_versions, :published_required_when_published,
              check: "status <> 'published' OR published_at IS NOT NULL"

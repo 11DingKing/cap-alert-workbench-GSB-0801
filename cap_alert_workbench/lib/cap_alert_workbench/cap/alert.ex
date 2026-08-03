@@ -18,6 +18,7 @@ defmodule CapAlertWorkbench.Cap.Alert do
     field :draft_revision, :integer, default: 1
     field :published_identifier, :string
     field :latest_published_version, :integer
+
     field :status, Ecto.Enum,
       values: [:draft, :in_review, :approved, :rejected, :published, :canceled],
       default: :draft

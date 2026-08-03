@@ -33,3 +33,7 @@ config :phoenix_live_view,
 # Sort query params output of verified routes for robust url comparisons
 config :phoenix,
   sort_verified_routes_query_params: true
+
+# The outbox dispatcher polls the DB on an interval; disable it in test so the
+# long-lived process does not race with the per-test SQL sandbox.
+config :cap_alert_workbench, :start_outbox_dispatcher, false

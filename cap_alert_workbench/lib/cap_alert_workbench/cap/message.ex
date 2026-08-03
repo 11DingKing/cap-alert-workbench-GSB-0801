@@ -17,7 +17,12 @@ defmodule CapAlertWorkbench.Cap.Message do
 
   alias CapAlertWorkbench.Cap.{Enums, Info}
 
-  @type extension :: {String.t(), [map()], String.t() | nil}
+  @type extension_node :: %{
+          name: String.t(),
+          ns: String.t(),
+          attrs: %{String.t() => String.t()},
+          children: [String.t() | extension_node()]
+        }
 
   @type t :: %__MODULE__{
           identifier: String.t(),
@@ -39,7 +44,7 @@ defmodule CapAlertWorkbench.Cap.Message do
           area_codes: [String.t()],
           area_descriptions: [String.t()],
           references: [String.t()],
-          extensions: [extension()],
+          extensions: [extension_node()],
           incidents: [map()]
         }
 

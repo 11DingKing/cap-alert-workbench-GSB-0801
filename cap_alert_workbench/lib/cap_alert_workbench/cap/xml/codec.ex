@@ -96,6 +96,7 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
        optional(:description, info.description),
        optional(:instruction, info.instruction),
        area_nodes(info.areas)
+       | extension_nodes(info.extensions)
      ]
      |> List.flatten()
      |> Enum.reject(&is_nil/1)}
@@ -108,8 +109,7 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
          {:areaDesc, area.description},
          {:polygon, nil, ""},
          {:circle, nil, ""},
-         {:geocode, nil,
-          [{:valueName, "AREA_CODE"}, {:value, area.code}]},
+         {:geocode, nil, [{:valueName, "AREA_CODE"}, {:value, area.code}]},
          {:altitude, nil, ""},
          {:ceiling, nil, ""}
        ]}
@@ -123,17 +123,28 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
   defp optional(_name, ""), do: nil
   defp optional(name, value), do: {name, value}
 
-  defp extension_nodes(extensions) do
+  defp extension_nodes(extensions) when is_list(extensions) do
     Enum.map(extensions, &build_extension/1)
   end
 
+  defp extension_nodes(_), do: []
+
+  # Full node-tree form (used by imported XML so extensions round-trip exactly,
+  # including nested children, attributes and namespaces).
+  defp build_extension(%{name: name, attrs: attrs, children: children}) do
+    attr_map = Map.new(attrs, fn {k, v} -> {to_string(k), to_string(v)} end)
+    child_nodes = Enum.map(children, &build_extension_child/1)
+    {to_string(name), attr_map, child_nodes}
+  end
+
+  # Legacy tuple form {name, attrs, value} retained for backwards compatibility.
   defp build_extension({name, attrs, children}) when is_list(attrs) and is_list(children) do
     attr_map = Map.new(attrs, fn {k, v} -> {to_string(k), to_string(v)} end)
 
     child_nodes =
       Enum.map(children, fn
         %{name: cname, attrs: cattrs, children: cchildren} ->
-          build_extension({cname, Map.to_list(cattrs), cchildren})
+          build_extension(%{name: cname, attrs: Map.to_list(cattrs), children: cchildren})
 
         text when is_binary(text) ->
           text
@@ -149,6 +160,13 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
   defp build_extension([name, attrs, children]) when is_list(attrs) do
     build_extension({name, attrs, children})
   end
+
+  defp build_extension_child(%{name: name, attrs: attrs, children: children}) do
+    build_extension(%{name: name, attrs: attrs, children: children})
+  end
+
+  defp build_extension_child(text) when is_binary(text), do: text
+  defp build_extension_child(other), do: to_string(other)
 
   @doc "Formats a DateTime as a CAP timestamp (yyyy-MM-ddTHH:MM:SS+00:00)."
   def format_ref_time(%DateTime{} = dt) do
@@ -269,7 +287,8 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
       headline: fields["headline"],
       description: fields["description"],
       instruction: fields["instruction"],
-      areas: areas
+      areas: areas,
+      extensions: extract_info_extensions(children)
     }
   end
 
@@ -311,21 +330,41 @@ defmodule CapAlertWorkbench.Cap.Xml.Codec do
     |> String.trim()
   end
 
-  defp extract_extensions(children) do
-    cap_elements = ~w(identifier sender sent status msgType scope restriction addresses
-      code note references incidents info)
+  @alert_elements ~w(identifier sender sent status msgType scope restriction addresses
+    code note references incidents info)
 
+  @info_elements ~w(language category event responseType urgency severity certainty
+    audience eventCode effective onset expires senderName headline description instruction
+    web contact parameter area)
+
+  defp extract_extensions(children) do
     children
     |> Enum.filter(fn
-      %{name: name, ns: ns} ->
-        name not in cap_elements and (ns not in ["", @cap_ns] or String.contains?(name, ":"))
+      %{name: name} -> name not in @alert_elements
+      _ -> false
+    end)
+    |> Enum.map(&normalize_extension_node/1)
+  end
 
-      _ ->
-        false
+  defp extract_info_extensions(children) do
+    children
+    |> Enum.filter(fn
+      %{name: name} -> name not in @info_elements
+      _ -> false
     end)
-    |> Enum.map(fn node ->
-      {node.name, Map.to_list(node.attrs), text_content(node.children)}
-    end)
+    |> Enum.map(&normalize_extension_node/1)
+  end
+
+  # Preserves the full parsed node tree so unknown elements (including nested
+  # children, attributes and namespace prefixes) round-trip byte-for-byte.
+  defp normalize_extension_node(%{name: name, ns: ns, attrs: attrs, children: children}) do
+    normalized_children =
+      Enum.map(children, fn
+        %{} = child -> normalize_extension_node(child)
+        text -> text
+      end)
+
+    %{name: name, ns: ns, attrs: attrs, children: normalized_children}
   end
 
   defp split_refs(nil), do: []

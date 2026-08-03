@@ -21,12 +21,8 @@ defmodule CapAlertWorkbench.Repo.Migrations.CreateCapAlerts do
     create index(:cap_alerts, [:status])
     create index(:cap_alerts, [:last_activity_at])
 
-    create constraint(:cap_alerts, :draft_lock_version_positive,
-             check: "draft_lock_version >= 1"
-           )
+    create constraint(:cap_alerts, :draft_lock_version_positive, check: "draft_lock_version >= 1")
 
-    create constraint(:cap_alerts, :draft_revision_positive,
-             check: "draft_revision >= 1"
-           )
+    create constraint(:cap_alerts, :draft_revision_positive, check: "draft_revision >= 1")
   end
 end

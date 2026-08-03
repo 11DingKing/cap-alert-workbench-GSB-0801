@@ -17,7 +17,7 @@ defmodule CapAlertWorkbench.Cap.ConcurrencyTest do
     # checkout via allowances.
     parent = self()
 
-    {:ok, pid1} =
+    {:ok, _pid1} =
       Task.start_link(fn ->
         Ecto.Adapters.SQL.Sandbox.allow(CapAlertWorkbench.Repo, parent, self())
 
@@ -32,7 +32,7 @@ defmodule CapAlertWorkbench.Cap.ConcurrencyTest do
         send(parent, {:result, :a, result})
       end)
 
-    {:ok, pid2} =
+    {:ok, _pid2} =
       Task.start_link(fn ->
         Ecto.Adapters.SQL.Sandbox.allow(CapAlertWorkbench.Repo, parent, self())
 
