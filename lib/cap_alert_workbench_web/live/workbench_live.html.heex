@@ -1,0 +1,628 @@
+<Layouts.app flash={@flash}>
+  <div class="mx-auto max-w-7xl px-6 py-6 space-y-6">
+    <div class="flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <h1 class="text-2xl font-bold tracking-tight">公共预警编审工作台</h1>
+        <p class="text-sm text-zinc-500">
+          CAP 1.2 · 暴雨 / 强对流处置建议 · 编审分离，发布不可改，变更只能更正或解除
+        </p>
+      </div>
+      <form id="actor-form" phx-change="set_actor" class="flex items-center gap-3 text-sm">
+        <label class="flex items-center gap-1">
+          <span class="text-zinc-500">操作人</span>
+          <input
+            type="text"
+            name="actor"
+            value={@actor}
+            class="rounded-md border border-zinc-300 px-2 py-1 text-sm"
+          />
+        </label>
+        <label class="flex items-center gap-1">
+          <span class="text-zinc-500">复核人</span>
+          <input
+            type="text"
+            name="reviewer"
+            value={@reviewer}
+            class="rounded-md border border-zinc-300 px-2 py-1 text-sm"
+          />
+        </label>
+      </form>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-12">
+      <%!-- 左侧：消息流列表 --%>
+      <aside class="lg:col-span-3">
+        <h2 class="mb-2 text-sm font-semibold text-zinc-500">消息流</h2>
+        <div id="streams" phx-update="stream" class="space-y-2">
+          <div :for={{dom_id, stream} <- @streams.streams} id={dom_id}>
+            <.link
+              navigate={~p"/streams/#{stream.id}"}
+              class={[
+                "block rounded-lg border p-3 transition hover:border-zinc-400",
+                @detail && @detail.stream.id == stream.id && "border-zinc-900 bg-zinc-50",
+                (!@detail || @detail.stream.id != stream.id) && "border-zinc-200"
+              ]}
+            >
+              <div class="flex items-center justify-between gap-2">
+                <span class="font-mono text-xs font-semibold">{stream.identifier}</span>
+                <span class={[
+                  "rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                  stream_state_badge_class(stream.state)
+                ]}>
+                  {stream_state_label(stream.state)}
+                </span>
+              </div>
+              <div class="mt-1 text-xs text-zinc-500">{stream.sender}</div>
+            </.link>
+          </div>
+        </div>
+      </aside>
+
+      <%!-- 右侧：工作台主体 --%>
+      <main class="space-y-6 lg:col-span-9">
+        <%= if @detail do %>
+          <% stream = @detail.stream %>
+          <% draft = @detail.active_draft %>
+
+          <section class="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div class="flex items-center gap-2">
+                  <h2 class="font-mono text-lg font-bold">{stream.identifier}</h2>
+                  <span class={[
+                    "rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                    stream_state_badge_class(stream.state)
+                  ]}>
+                    {stream_state_label(stream.state)}
+                  </span>
+                </div>
+                <p class="text-sm text-zinc-500">发送方 {stream.sender}</p>
+              </div>
+              <div :if={stream.state == :published and draft == nil} class="flex gap-2">
+                <button
+                  id="btn-start-correction"
+                  phx-click="start_correction"
+                  class="rounded-md bg-amber-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-amber-500"
+                >
+                  发起更正
+                </button>
+                <button
+                  id="btn-start-cancellation"
+                  phx-click="start_cancellation"
+                  class="rounded-md bg-zinc-700 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-zinc-600"
+                >
+                  发起解除
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <%!-- 草稿编辑 / 复核 / 发布 --%>
+          <section
+            :if={draft != nil}
+            id="draft-panel"
+            class="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm"
+          >
+            <div class="mb-3 flex flex-wrap items-center gap-3">
+              <h3 class="text-base font-semibold">草稿 v{draft.version_number}</h3>
+              <span class={[
+                "rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                workflow_badge_class(draft.workflow)
+              ]}>
+                {workflow_label(draft.workflow)}
+              </span>
+              <span class="text-xs text-zinc-500">
+                {msg_type_label(draft.msg_type)} · 乐观锁 #{draft.lock_version}
+              </span>
+            </div>
+
+            <.form
+              :if={editable?(draft)}
+              for={@draft_form}
+              id="draft-form"
+              phx-change="form_changed"
+              phx-submit="save_draft"
+              class="space-y-4"
+            >
+              <input type="hidden" name="draft[lock_version]" value={draft.lock_version} />
+              <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+                <label class="block text-sm">
+                  <span class="mb-1 block text-zinc-600">状态 status</span>
+                  <select
+                    id="draft-status"
+                    name="draft[status]"
+                    class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                  >
+                    <option
+                      :for={option <- enum_options(:status)}
+                      value={option}
+                      selected={option == draft.payload["status"]}
+                    >
+                      {option}
+                    </option>
+                  </select>
+                </label>
+              </div>
+
+              <div
+                :for={{info, index} <- Enum.with_index(@draft_infos)}
+                id={"info-fieldset-#{index}"}
+                class="space-y-3 rounded-lg border border-zinc-200 bg-zinc-50/50 p-3"
+              >
+                <div class="flex items-center justify-between">
+                  <h4 class="text-sm font-semibold text-zinc-700">
+                    info 段 {index + 1}
+                    <span
+                      :if={info["geocodes"] && info["geocodes"] != ""}
+                      class="ml-1 font-mono text-xs text-zinc-500"
+                    >
+                      （{info["geocodes"]}）
+                    </span>
+                  </h4>
+                  <button
+                    :if={length(@draft_infos) > 1}
+                    id={"btn-remove-info-#{index}"}
+                    type="submit"
+                    name="form_action"
+                    value={"remove_info:#{index}"}
+                    class="rounded-md border border-rose-300 px-2 py-0.5 text-xs text-rose-700 transition hover:bg-rose-50"
+                  >
+                    删除此段
+                  </button>
+                </div>
+                <div class="grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">事件名称</span>
+                    <input
+                      type="text"
+                      id={"draft-event-#{index}"}
+                      name={"draft[infos][#{index}][event]"}
+                      value={info["event"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">标题 headline</span>
+                    <input
+                      type="text"
+                      id={"draft-headline-#{index}"}
+                      name={"draft[infos][#{index}][headline]"}
+                      value={info["headline"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">语言</span>
+                    <input
+                      type="text"
+                      id={"draft-language-#{index}"}
+                      name={"draft[infos][#{index}][language]"}
+                      value={info["language"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                </div>
+                <div class="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">类别 category</span>
+                    <select
+                      id={"draft-category-#{index}"}
+                      name={"draft[infos][#{index}][category]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:category)}
+                        value={option}
+                        selected={option == info["category"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">紧急度 urgency</span>
+                    <select
+                      id={"draft-urgency-#{index}"}
+                      name={"draft[infos][#{index}][urgency]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:urgency)}
+                        value={option}
+                        selected={option == info["urgency"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">严重度 severity</span>
+                    <select
+                      id={"draft-severity-#{index}"}
+                      name={"draft[infos][#{index}][severity]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:severity)}
+                        value={option}
+                        selected={option == info["severity"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">确定性 certainty</span>
+                    <select
+                      id={"draft-certainty-#{index}"}
+                      name={"draft[infos][#{index}][certainty]"}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    >
+                      <option
+                        :for={option <- enum_options(:certainty)}
+                        value={option}
+                        selected={option == info["certainty"]}
+                      >
+                        {option}
+                      </option>
+                    </select>
+                  </label>
+                </div>
+                <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">地区编码（逗号分隔）</span>
+                    <input
+                      type="text"
+                      id={"draft-geocodes-#{index}"}
+                      name={"draft[infos][#{index}][geocodes]"}
+                      value={info["geocodes"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 font-mono text-sm"
+                    />
+                  </label>
+                  <label class="block text-sm">
+                    <span class="mb-1 block text-zinc-600">地区描述</span>
+                    <input
+                      type="text"
+                      id={"draft-area-desc-#{index}"}
+                      name={"draft[infos][#{index}][area_desc]"}
+                      value={info["area_desc"]}
+                      class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                    />
+                  </label>
+                </div>
+                <label class="block text-sm">
+                  <span class="mb-1 block text-zinc-600">预警描述 description</span>
+                  <textarea
+                    id={"draft-description-#{index}"}
+                    name={"draft[infos][#{index}][description]"}
+                    rows="2"
+                    class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                  >{info["description"]}</textarea>
+                </label>
+                <label class="block text-sm">
+                  <span class="mb-1 block text-zinc-600">处置建议 instruction</span>
+                  <textarea
+                    id={"draft-instruction-#{index}"}
+                    name={"draft[infos][#{index}][instruction]"}
+                    rows="2"
+                    class="w-full rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                  >{info["instruction"]}</textarea>
+                </label>
+              </div>
+
+              <div class="flex flex-wrap gap-2">
+                <button
+                  id="btn-add-info"
+                  type="submit"
+                  name="form_action"
+                  value="add_info"
+                  class="rounded-md border border-zinc-400 px-3 py-1.5 text-sm font-semibold text-zinc-700 transition hover:bg-zinc-100"
+                >
+                  拆分 info 段
+                </button>
+                <button
+                  id="btn-save-draft"
+                  type="submit"
+                  class="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-blue-500"
+                >
+                  保存草稿
+                </button>
+                <button
+                  :if={draft.workflow == :editing}
+                  id="btn-submit-review"
+                  type="button"
+                  phx-click="submit_review"
+                  phx-value-lock_version={draft.lock_version}
+                  class="rounded-md bg-violet-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-violet-500"
+                >
+                  提交复核
+                </button>
+              </div>
+            </.form>
+
+            <p :if={!editable?(draft)} class="rounded-md bg-zinc-50 p-3 text-sm text-zinc-600">
+              当前状态为「{workflow_label(draft.workflow)}」，内容已锁定。
+            </p>
+
+            <%!-- 复核面板 --%>
+            <div
+              :if={draft.workflow == :in_review}
+              id="review-panel"
+              class="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3"
+            >
+              <h4 class="mb-2 text-sm font-semibold text-amber-900">
+                复核（钉住乐观锁 #{draft.lock_version}，草稿变更会使结论失效）
+              </h4>
+              <form
+                id="review-form"
+                phx-submit="decide_review"
+                class="flex flex-wrap items-center gap-2"
+              >
+                <input type="hidden" name="pinned_lock_version" value={draft.lock_version} />
+                <input
+                  type="text"
+                  name="note"
+                  placeholder="复核意见"
+                  class="min-w-64 flex-1 rounded-md border border-zinc-300 px-2 py-1.5 text-sm"
+                />
+                <button
+                  id="btn-approve"
+                  type="submit"
+                  name="decision"
+                  value="approved"
+                  class="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-emerald-500"
+                >
+                  复核通过
+                </button>
+                <button
+                  id="btn-reject"
+                  type="submit"
+                  name="decision"
+                  value="rejected"
+                  class="rounded-md bg-rose-600 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-rose-500"
+                >
+                  退回修改
+                </button>
+              </form>
+            </div>
+
+            <%!-- 发布面板 --%>
+            <div
+              :if={draft.workflow == :approved}
+              id="publish-panel"
+              class="mt-4 flex items-center justify-between rounded-lg border border-emerald-200 bg-emerald-50 p-3"
+            >
+              <p class="text-sm text-emerald-900">
+                复核已通过。发布将冻结 CAP XML、写入审计与通知 outbox（单事务），发布后不可修改。
+              </p>
+              <button
+                id="btn-publish"
+                phx-click="publish"
+                phx-value-version_id={draft.id}
+                class="rounded-md bg-emerald-700 px-4 py-2 text-sm font-bold text-white transition hover:bg-emerald-600"
+              >
+                发布
+              </button>
+            </div>
+          </section>
+
+          <%!-- 版本历史与差异 --%>
+          <section class="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm">
+            <h3 class="mb-3 text-base font-semibold">版本历史（不可变快照）</h3>
+            <form
+              id="diff-form"
+              phx-submit="diff"
+              class="mb-3 flex flex-wrap items-center gap-2 text-sm"
+            >
+              <select name="a" class="rounded-md border border-zinc-300 px-2 py-1">
+                <option :for={v <- @detail.versions} value={v.id}>v{v.version_number} A</option>
+              </select>
+              <select name="b" class="rounded-md border border-zinc-300 px-2 py-1">
+                <option :for={v <- @detail.versions} value={v.id}>v{v.version_number} B</option>
+              </select>
+              <button
+                id="btn-diff"
+                type="submit"
+                class="rounded-md bg-zinc-800 px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-zinc-700"
+              >
+                对比版本差异
+              </button>
+            </form>
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="border-b text-left text-xs text-zinc-500">
+                  <th class="py-2">版本</th>
+                  <th>类型</th>
+                  <th>工作流</th>
+                  <th>锁号</th>
+                  <th>最近保存</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  :for={v <- @detail.versions}
+                  id={"version-row-#{v.id}"}
+                  class="border-b last:border-0"
+                >
+                  <td class="py-2 font-mono">v{v.version_number}</td>
+                  <td>{msg_type_label(v.msg_type)}</td>
+                  <td>
+                    <span class={[
+                      "rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                      workflow_badge_class(v.workflow)
+                    ]}>
+                      {workflow_label(v.workflow)}
+                    </span>
+                  </td>
+                  <td class="font-mono text-xs">{v.lock_version}</td>
+                  <td class="text-xs text-zinc-500">{v.edited_by}</td>
+                  <td>
+                    <button
+                      id={"btn-xml-#{v.id}"}
+                      phx-click="export_xml"
+                      phx-value-version_id={v.id}
+                      class="rounded-md border border-zinc-300 px-2 py-1 text-xs transition hover:bg-zinc-50"
+                    >
+                      CAP XML
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div :if={@diff} id="diff-panel" class="mt-4 rounded-lg border border-zinc-200">
+              <h4 class="border-b bg-zinc-50 px-3 py-2 text-sm font-semibold">
+                v{@diff.a.version_number} → v{@diff.b.version_number} 差异
+              </h4>
+
+              <div :if={@diff.areas != []} id="area-diff" class="border-b px-3 py-2">
+                <h5 class="mb-2 text-xs font-semibold text-zinc-500">按地区对比</h5>
+                <table class="w-full text-sm">
+                  <tbody>
+                    <tr
+                      :for={area <- @diff.areas}
+                      id={"area-diff-#{area.geocode}"}
+                      class="border-b last:border-0"
+                    >
+                      <td class="w-32 py-1.5 font-mono text-xs">{area.geocode}</td>
+                      <td class="py-1.5">
+                        <span class={[
+                          "mr-2 rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                          area_status_class(area.status)
+                        ]}>
+                          {area_status_label(area.status)}
+                        </span>
+                        <span :if={area.status == :unchanged} class="text-xs text-zinc-500">
+                          严重度等字段与基线一致
+                        </span>
+                        <span :for={{field, old, new} <- area.changes} class="mr-3 text-xs">
+                          <span class="font-mono text-zinc-500">{field}</span>
+                          <span class="mx-1 rounded bg-rose-50 px-1 text-rose-800 line-through">{old ||
+                            "（空）"}</span>
+                          →
+                          <span class="ml-1 rounded bg-emerald-50 px-1 text-emerald-800">{new ||
+                            "（空）"}</span>
+                        </span>
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <table class="w-full text-sm">
+                <tbody>
+                  <tr :if={map_size(@diff.rows) == 0}>
+                    <td class="px-3 py-2 text-zinc-500">两个版本内容一致</td>
+                  </tr>
+                  <tr :for={{field, {old, new}} <- @diff.rows} class="border-b last:border-0">
+                    <td class="w-40 px-3 py-2 font-mono text-xs text-zinc-500">{field}</td>
+                    <td class="px-3 py-2">
+                      <div class="rounded bg-rose-50 px-2 py-0.5 text-rose-800 line-through">
+                        {old || "（空）"}
+                      </div>
+                      <div class="mt-1 rounded bg-emerald-50 px-2 py-0.5 text-emerald-800">
+                        {new || "（空）"}
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+
+          <%!-- 已发布文档 --%>
+          <section class="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm">
+            <h3 class="mb-3 text-base font-semibold">已发布文档（冻结，不可修改）</h3>
+            <p :if={@detail.published_documents == []} class="text-sm text-zinc-500">尚未发布</p>
+            <ul class="space-y-2">
+              <li
+                :for={doc <- @detail.published_documents}
+                id={"published-#{doc.id}"}
+                class="flex items-center justify-between rounded-lg border border-zinc-200 px-3 py-2 text-sm"
+              >
+                <span class="font-mono text-xs">{doc.identifier}</span>
+                <span>{msg_type_label(doc.msg_type)}</span>
+                <span class="text-xs text-zinc-500">{Calendar.strftime(
+                  doc.sent_at,
+                  "%Y-%m-%d %H:%M:%S"
+                )} UTC</span>
+              </li>
+            </ul>
+          </section>
+
+          <div class="grid grid-cols-1 gap-6 md:grid-cols-2">
+            <%!-- 审计 --%>
+            <section class="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm">
+              <h3 class="mb-3 text-base font-semibold">审计事件</h3>
+              <ul class="max-h-72 space-y-1 overflow-y-auto text-sm">
+                <li
+                  :for={event <- @detail.audit_events}
+                  id={"audit-#{event.id}"}
+                  class="flex items-baseline justify-between gap-2 border-b border-zinc-100 py-1 last:border-0"
+                >
+                  <span class="font-medium">{event.event}</span>
+                  <span class="text-xs text-zinc-500">
+                    {event.actor} · {Calendar.strftime(event.inserted_at, "%m-%d %H:%M:%S")}
+                  </span>
+                </li>
+              </ul>
+            </section>
+
+            <%!-- Outbox --%>
+            <section class="rounded-xl border border-zinc-200 bg-white p-4 shadow-sm">
+              <h3 class="mb-3 text-base font-semibold">通知 outbox</h3>
+              <p :if={@detail.outbox_events == []} class="text-sm text-zinc-500">暂无待通知事件</p>
+              <ul class="space-y-1 text-sm">
+                <li
+                  :for={event <- @detail.outbox_events}
+                  id={"outbox-#{event.id}"}
+                  class="flex items-center justify-between rounded border border-zinc-100 px-2 py-1"
+                >
+                  <span>{event.type}</span>
+                  <span class={[
+                    "rounded-full px-2 py-0.5 text-xs ring-1 ring-inset",
+                    if(event.status == :pending,
+                      do: "bg-amber-100 text-amber-800 ring-amber-600/20",
+                      else: "bg-emerald-100 text-emerald-800 ring-emerald-600/20"
+                    )
+                  ]}>
+                    {event.status}
+                  </span>
+                </li>
+              </ul>
+            </section>
+          </div>
+        <% else %>
+          <div class="rounded-xl border border-dashed border-zinc-300 p-10 text-center text-zinc-500">
+            从左侧选择一个消息流开始编审
+          </div>
+        <% end %>
+      </main>
+    </div>
+
+    <%!-- XML 预览 --%>
+    <div
+      :if={@xml_preview}
+      id="xml-modal"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/50 p-6"
+    >
+      <div class="max-h-[80vh] w-full max-w-3xl overflow-hidden rounded-xl bg-white shadow-xl">
+        <div class="flex items-center justify-between border-b px-4 py-2">
+          <h4 class="text-sm font-semibold">CAP XML · v{@xml_preview.version_id}</h4>
+          <button
+            id="btn-close-xml"
+            phx-click="close_xml"
+            class="rounded-md border border-zinc-300 px-2 py-1 text-xs transition hover:bg-zinc-50"
+          >
+            关闭
+          </button>
+        </div>
+        <pre
+          id="xml-content"
+          class="max-h-[70vh] overflow-auto bg-zinc-950 p-4 text-xs text-emerald-200"
+        >{@xml_preview.xml}</pre>
+      </div>
+    </div>
+  </div>
+</Layouts.app>
