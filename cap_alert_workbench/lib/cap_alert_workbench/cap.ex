@@ -682,6 +682,43 @@ defmodule CapAlertWorkbench.Cap do
     create_follow_up(alert_id, attrs, actor, :cancellation, :cancel, [])
   end
 
+  @doc """
+  Issues the specific cancellation `CN-20260729-GD-RAIN-001-C2` derived from the
+  currently published version (round 2 / C1).
+
+  The cancellation:
+    * references precisely the round-2 published C1 document (not the round-1
+      root and not a chained reference list);
+    * preserves the multi-info structure validated in round 3 — both areas keep
+      their own `<info>` segment with their C1 severity, so the area-to-severity
+      correspondence remains intact inside the cancellation document;
+    * is idempotent: a repeated publish request returns the existing canceled
+      version without inserting a second version, audit row or outbox message;
+    * leaves the full version chain (1 -> 2 -> 3) queryable.
+
+  Every state transition is recorded by the shared `create_follow_up/6`
+  transaction (supersede of C1, insertion of C2, alert status -> canceled) with
+  an audit event and a transactional outbox notification.
+  """
+  @spec create_cancellation_c2(String.t(), String.t() | nil) :: result()
+  def create_cancellation_c2(alert_id, actor \\ nil) do
+    c2_identifier = "CN-20260729-GD-RAIN-001-C2"
+
+    attrs = %{
+      "identifier" => c2_identifier,
+      "headline" => "广东省暴雨预警解除（C2）",
+      "description" => "本轮暴雨过程结束，湛江、茂名两地预警同步解除。解除消息保留 C1 验证过的多 info 结构。",
+      "instruction" => "预警已解除，请恢复正常生产生活秩序，仍需注意次生灾害。",
+      "note" => "预警解除 C2"
+    }
+
+    create_follow_up(alert_id, attrs, actor, :cancellation, :cancel,
+      identifier: c2_identifier,
+      precise_reference: :published,
+      on_exists: :return_existing
+    )
+  end
+
   @doc "Diffs two versions by number. Returns `{:ok, changes}` or `:error`."
   def diff_versions(alert_id, version_a, version_b) do
     with {:ok, a} <- get_version(alert_id, version_a),
@@ -817,9 +854,18 @@ defmodule CapAlertWorkbench.Cap do
     XmlCodec.encode!(message)
   end
 
+  defp check_follow_up_status(alert) do
+    if alert.status != :published do
+      {:error, {:invalid_status, alert.status}}
+    else
+      {:ok, alert}
+    end
+  end
+
   defp create_follow_up(alert_id, attrs, actor, kind, msg_type, opts) do
     new_identifier = Keyword.get(opts, :identifier)
     precise_ref = Keyword.get(opts, :precise_reference)
+    on_exists = Keyword.get(opts, :on_exists, :error)
 
     Multi.new()
     |> Multi.run(:alert_lock, fn repo, _ ->
@@ -827,161 +873,246 @@ defmodule CapAlertWorkbench.Cap do
         from(a in Alert, where: a.id == ^alert_id, lock: "FOR UPDATE")
         |> repo.one!()
 
-      if alert.status != :published do
-        {:error, {:invalid_status, alert.status}}
-      else
-        {:ok, alert}
+      cond do
+        # Idempotent re-request: if the target version already exists and the
+        # alert has reached the terminal state for this operation, return the
+        # existing result without inserting another version, audit row or
+        # outbox message.
+        on_exists == :return_existing and is_binary(new_identifier) and
+            alert.status in [:canceled, :published] ->
+          existing =
+            Version
+            |> where([v], v.alert_id == ^alert.id)
+            |> where([v], fragment("payload->>'identifier' = ?", ^new_identifier))
+            |> order_by([v], asc: v.version_number)
+            |> limit(1)
+            |> repo.one()
+
+          if existing do
+            {:ok, %{idempotent: true, alert: alert, existing: existing}}
+          else
+            check_follow_up_status(alert)
+          end
+
+        true ->
+          check_follow_up_status(alert)
       end
     end)
-    |> Multi.run(:idempotency, fn repo, %{alert_lock: alert} ->
-      # When a fixed identifier is supplied (e.g. C1), reject if a version
-      # carrying that identifier already exists. Runs after the FOR UPDATE row
-      # lock so concurrent transactions serialize and only one can win.
-      if is_binary(new_identifier) do
-        exists? =
-          Version
-          |> where([v], v.alert_id == ^alert.id)
-          |> where([v], fragment("payload->>'identifier' = ?", ^new_identifier))
-          |> repo.exists?()
+    |> Multi.run(:idempotency, fn repo, %{alert_lock: lock_result} ->
+      case lock_result do
+        %{idempotent: true} ->
+          {:ok, :idempotent}
 
-        if exists? do
-          {:error, {:already_exists, new_identifier}}
-        else
-          {:ok, :not_found}
-        end
-      else
-        {:ok, :not_applicable}
+        %{} = alert ->
+          # When a fixed identifier is supplied (e.g. C1), reject if a version
+          # carrying that identifier already exists. Runs after the FOR UPDATE
+          # row lock so concurrent transactions serialize and only one can win.
+          if is_binary(new_identifier) do
+            exists? =
+              Version
+              |> where([v], v.alert_id == ^alert.id)
+              |> where([v], fragment("payload->>'identifier' = ?", ^new_identifier))
+              |> repo.exists?()
+
+            if exists? do
+              if on_exists == :return_existing do
+                {:ok, :exists}
+              else
+                {:error, {:already_exists, new_identifier}}
+              end
+            else
+              {:ok, :not_found}
+            end
+          else
+            {:ok, :not_applicable}
+          end
       end
     end)
-    |> Multi.run(:published, fn repo, %{alert_lock: alert, idempotency: _} ->
-      version =
-        Version
-        |> where([v], v.alert_id == ^alert.id and v.status == :published)
-        |> order_by([v], desc: v.version_number)
-        |> limit(1)
-        |> repo.one()
+    |> Multi.run(:published, fn repo, %{alert_lock: lock_result, idempotency: idem} ->
+      case {lock_result, idem} do
+        {%{idempotent: true}, _} ->
+          {:ok, nil}
 
-      if version, do: {:ok, version}, else: {:error, :no_published_version}
+        _ ->
+          version =
+            Version
+            |> where([v], v.alert_id == ^lock_result.id and v.status == :published)
+            |> order_by([v], desc: v.version_number)
+            |> limit(1)
+            |> repo.one()
+
+          if version, do: {:ok, version}, else: {:error, :no_published_version}
+      end
     end)
-    |> Multi.run(:root_version, fn repo, %{alert_lock: alert} ->
-      version =
-        Version
-        |> where([v], v.alert_id == ^alert.id and v.kind == :draft)
-        |> order_by([v], asc: v.version_number)
-        |> limit(1)
-        |> repo.one()
+    |> Multi.run(:root_version, fn repo, %{alert_lock: lock_result} ->
+      case lock_result do
+        %{idempotent: true} ->
+          {:ok, nil}
 
-      {:ok, version}
+        _ ->
+          version =
+            Version
+            |> where([v], v.alert_id == ^lock_result.id and v.kind == :draft)
+            |> order_by([v], asc: v.version_number)
+            |> limit(1)
+            |> repo.one()
+
+          {:ok, version}
+      end
     end)
-    |> Multi.run(:supersede, fn repo, %{published: published} ->
-      new_id = Ecto.UUID.generate()
+    |> Multi.run(:supersede, fn repo, %{alert_lock: lock_result, published: published} ->
+      case lock_result do
+        %{idempotent: true} ->
+          {:ok, :skipped}
 
-      superseded =
-        published
-        |> Version.changeset(%{status: :superseded, superseded_by: new_id})
-        |> repo.update!()
+        _ ->
+          new_id = Ecto.UUID.generate()
 
-      {:ok, %{version: superseded, new_id: new_id}}
+          superseded =
+            published
+            |> Version.changeset(%{status: :superseded, superseded_by: new_id})
+            |> repo.update!()
+
+          {:ok, %{version: superseded, new_id: new_id}}
+      end
     end)
     |> Multi.run(:new_version, fn repo,
                                   %{
-                                    alert_lock: alert,
+                                    alert_lock: lock_result,
                                     published: published,
                                     root_version: root_version,
-                                    supersede: %{new_id: new_id}
+                                    supersede: supersede
                                   } ->
-      next_number = published.version_number + 1
+      case lock_result do
+        %{idempotent: true, existing: existing} ->
+          {:ok,
+           %{
+             version: existing,
+             alert: lock_result.alert,
+             xml: existing.xml_snapshot,
+             idempotent: true
+           }}
 
-      base_message =
-        published.payload
-        |> map_to_message()
-        |> merge_message(attrs)
+        _ ->
+          %{new_id: new_id} = supersede
+          alert = lock_result
+          next_number = published.version_number + 1
 
-      references =
-        case precise_ref do
-          :root when not is_nil(root_version) ->
-            [build_version_reference(root_version)]
+          base_message =
+            published.payload
+            |> map_to_message()
+            |> merge_message(attrs)
 
-          _ ->
-            build_references(alert, published, msg_type)
-        end
+          references =
+            case precise_ref do
+              :root when not is_nil(root_version) ->
+                [build_version_reference(root_version)]
 
-      base_message =
-        base_message
-        |> Map.put(:msg_type, msg_type)
-        |> Map.put(:references, references)
-        |> maybe_put_identifier(new_identifier)
+              :published ->
+                [build_version_reference(published)]
 
-      message =
-        case kind do
-          :cancellation ->
-            %{base_message | note: attrs["note"] || attrs[:note] || "预警解除"}
+              _ ->
+                build_references(alert, published, msg_type)
+            end
 
-          :correction ->
+          base_message =
             base_message
-        end
+            |> Map.put(:msg_type, msg_type)
+            |> Map.put(:references, references)
+            |> maybe_put_identifier(new_identifier)
 
-      with {:ok, message} <- Message.validate(message),
-           :ok <- AreaCodes.validate_codes(Message.area_codes(message)) do
-        xml = XmlCodec.encode!(message)
+          message =
+            case kind do
+              :cancellation ->
+                %{base_message | note: attrs["note"] || attrs[:note] || "预警解除"}
 
-        new_status = if kind == :cancellation, do: :canceled, else: :published
+              :correction ->
+                base_message
+            end
 
-        version =
-          %Version{id: new_id}
-          |> Version.changeset(%{
-            alert_id: alert.id,
-            version_number: next_number,
-            status: new_status,
-            kind: kind,
-            payload: message_to_map(message),
-            xml_snapshot: xml,
-            references: message.references,
-            created_by: actor,
-            published_at: utc_now(),
-            revision_seed: alert.draft_revision
-          })
-          |> repo.insert!()
+          with {:ok, message} <- Message.validate(message),
+               :ok <- AreaCodes.validate_codes(Message.area_codes(message)) do
+            xml = XmlCodec.encode!(message)
 
-        alert_status = if kind == :cancellation, do: :canceled, else: :published
+            new_status = if kind == :cancellation, do: :canceled, else: :published
 
-        updated_alert =
-          alert
-          |> Alert.changeset(%{
-            status: alert_status,
-            latest_published_version: next_number,
-            last_activity_at: utc_now()
-          })
-          |> repo.update!()
+            version =
+              %Version{id: new_id}
+              |> Version.changeset(%{
+                alert_id: alert.id,
+                version_number: next_number,
+                status: new_status,
+                kind: kind,
+                payload: message_to_map(message),
+                xml_snapshot: xml,
+                references: message.references,
+                created_by: actor,
+                published_at: utc_now(),
+                revision_seed: alert.draft_revision
+              })
+              |> repo.insert!()
 
-        {:ok, %{version: version, alert: updated_alert, xml: xml}}
-      else
-        {:error, reason} -> {:error, reason}
+            alert_status = if kind == :cancellation, do: :canceled, else: :published
+
+            updated_alert =
+              alert
+              |> Alert.changeset(%{
+                status: alert_status,
+                latest_published_version: next_number,
+                last_activity_at: utc_now()
+              })
+              |> repo.update!()
+
+            {:ok, %{version: version, alert: updated_alert, xml: xml}}
+          else
+            {:error, reason} -> {:error, reason}
+          end
       end
     end)
-    |> Multi.run(:audit, fn repo, %{new_version: %{alert: alert, version: version}} ->
-      action = if kind == :cancellation, do: :cancellation_created, else: :correction_created
+    |> Multi.run(:audit, fn repo, %{alert_lock: lock_result, new_version: new_version} ->
+      case new_version do
+        %{idempotent: true} ->
+          {:ok, :skipped}
 
-      event =
-        build_audit(alert, action, actor,
-          summary: "#{kind} version #{version.version_number}",
-          version: version,
-          metadata: %{version_number: version.version_number}
-        )
+        _ ->
+          action = if kind == :cancellation, do: :cancellation_created, else: :correction_created
 
-      {:ok, repo.insert!(event)}
+          event =
+            build_audit(lock_result, action, actor,
+              summary: "#{kind} version #{new_version.version.version_number}",
+              version: new_version.version,
+              metadata: %{version_number: new_version.version.version_number}
+            )
+
+          {:ok, repo.insert!(event)}
+      end
     end)
-    |> Multi.run(:outbox, fn repo, %{new_version: %{alert: alert, version: version, xml: xml}} ->
-      topic = if kind == :cancellation, do: "alert.canceled", else: "alert.corrected"
+    |> Multi.run(:outbox, fn repo, %{alert_lock: lock_result, new_version: new_version} ->
+      case new_version do
+        %{idempotent: true} ->
+          {:ok, :skipped}
 
-      insert_outbox(repo, alert, topic, %{
-        alert_id: alert.id,
-        version_number: version.version_number,
-        xml: xml
-      })
+        _ ->
+          topic = if kind == :cancellation, do: "alert.canceled", else: "alert.corrected"
+
+          insert_outbox(repo, lock_result, topic, %{
+            alert_id: lock_result.id,
+            version_number: new_version.version.version_number,
+            xml: new_version.xml
+          })
+      end
     end)
     |> Repo.transaction()
     |> case do
+      {:ok, %{new_version: %{idempotent: true, version: version, alert: alert}} = result} ->
+        preloaded = Repo.preload(alert, [:versions, :reviews, :audit_events])
+
+        {:ok,
+         result
+         |> Map.put(:alert, preloaded)
+         |> Map.put(:version, version)
+         |> Map.put(:idempotent, true)}
+
       {:ok, %{new_version: %{alert: alert}} = result} ->
         preloaded = Repo.preload(alert, [:versions, :reviews, :audit_events])
         broadcast(preloaded, String.to_atom("alert_#{kind}"))
